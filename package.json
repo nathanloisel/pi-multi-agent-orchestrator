@@ -1,0 +1,49 @@
+{
+	"name": "pi-multi-agent-orchestrator",
+	"version": "1.0.0",
+	"description": "Pi-native multi-agent orchestrator: delegate jobs to isolated sub-agent workers with model routing, DAG scheduling, retries, budgets, and validated structured results.",
+	"license": "MIT",
+	"author": "Nathan Loisel",
+	"type": "module",
+	"engines": {
+		"node": ">=22"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/nathanloisel/pi-multi-agent-orchestrator.git"
+	},
+	"bugs": {
+		"url": "https://github.com/nathanloisel/pi-multi-agent-orchestrator/issues"
+	},
+	"homepage": "https://github.com/nathanloisel/pi-multi-agent-orchestrator#readme",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"multi-agent",
+		"orchestrator",
+		"agentsview",
+		"typescript"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "tsx --test tests/*.test.ts",
+		"release:check": "npm run typecheck && npm test"
+	},
+	"dependencies": {
+		"yaml": "^2.9.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.19",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	}
+}

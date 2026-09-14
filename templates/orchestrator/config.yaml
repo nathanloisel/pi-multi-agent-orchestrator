@@ -1,0 +1,49 @@
+# Pi Multi-Agent Orchestrator — main configuration
+# Scaffolded by the /orchestrator-init command. Edit freely; reload Pi
+# (/reload) after changing this file. No secrets belong in this file.
+
+# Concurrency gates: how many worker subprocesses may run at once, globally
+# and per logical model alias (aliases are defined in models.yaml).
+concurrency:
+  global: 4
+  byModel:
+    worker-cheap: 4
+    worker-best: 2
+
+# Spend ceilings in USD. Remove a key to disable that ceiling.
+budgets:
+  perAttemptUsd: 0.50
+  perJobUsd: 3.00
+  # dailyUsd: 10.00
+
+# Routing rules choose a model alias before each attempt. Rules are flat
+# objects matched against the job (all listed filters must match):
+#   kind:    job kind (implementation | research | test-writing | debugging | review | other)
+#   tag:     job tag
+#   attempt: 1-based attempt number
+#   on:      "initial" | "validation_failed" | "any_failure"
+#   model:   the logical alias to use (required)
+routing:
+  rules: []
+  # - kind: research
+  #   model: worker-cheap
+  # - attempt: 3
+  #   on: any_failure
+  #   model: worker-best
+
+# AgentsView bridge — DISABLED by default for privacy. When enabled, finished
+# worker attempts are exported as local Pi session files (written with private
+# permissions) so AgentsView can display sub-agent sessions. Nothing is sent
+# anywhere; everything stays under exportDir on this machine.
+# To opt in: set enabled: true, then register exportDir with AgentsView via a
+# [[session_sources]] entry in ~/.agentsview/config.toml (verified with
+# AgentsView v0.41.1):
+#
+#   [[session_sources]]
+#   agent = "pi"
+#   dir = "~/.pi/orchestrator/agentsview-sessions"
+#
+# (see README → AgentsView integration).
+agentsView:
+  enabled: false
+  exportDir: ~/.pi/orchestrator/agentsview-sessions

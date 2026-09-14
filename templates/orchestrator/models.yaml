@@ -1,0 +1,48 @@
+# Pi Multi-Agent Orchestrator — model registry
+# Scaffolded by the /orchestrator-init command. EDIT THIS FILE: the model IDs
+# below are well-known examples — replace them with models actually available
+# on your provider plan. Run `pi --list-models` to list models your Pi install can
+# use, or check your provider's catalog. Reload Pi (/reload) after editing.
+#
+# Keys are logical aliases: agents, routing rules, and retry ladders refer to
+# these names, never to concrete provider IDs. The only place concrete
+# provider/model identifiers exist is this file.
+#
+# NEVER put API keys here. Reference environment-variable NAMES via apiKeyEnv
+# and export the variables in your shell (e.g. OPENROUTER_API_KEY).
+
+models:
+  worker-cheap:
+    provider: openrouter
+    model: anthropic/claude-haiku-4.5
+  worker-best:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.5
+  frontier:
+    provider: anthropic
+    model: claude-opus-4-8
+
+# Which alias is used when an agent has no runtime.model of its own.
+defaults:
+  worker: worker-cheap
+
+# Custom provider registrations (same shape as pi.registerProvider's config
+# form) — needed for local/OpenAI-compatible endpoints. Example (commented):
+#
+# providers:
+#   local-openai-compatible:
+#     name: Local LLM
+#     baseUrl: http://localhost:8080/v1
+#     api: openai-completions
+#     apiKey: $LOCAL_LLM_KEY
+#     models:
+#       - id: my-local-model
+#
+# Then point an alias at it (config-only backend switch, no other changes):
+#
+# models:
+#   worker-cheap:
+#     provider: local-openai-compatible
+#     model: my-local-model
+#     baseUrl: http://localhost:8080/v1
+#     apiKeyEnv: LOCAL_LLM_KEY

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Pi git-worktree isolation root (created inside repos when using
+# workspace.strategy: git-worktree)
+.pi-worktrees/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Logs, temp files, editor state
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local config and backups
+*.local.yaml
+*.local.yml
+*.local.json
+*.bak
+*~
+
+# Test run state (machine-local)
+tests/.architecture-integration-last-run.json
+
+# NOTE: source, templates/, tests/, and package-lock.json are intentionally
+# NOT ignored — they are part of the package.
