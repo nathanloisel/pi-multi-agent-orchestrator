@@ -30,20 +30,3 @@ routing:
   # - attempt: 3
   #   on: any_failure
   #   model: worker-best
-
-# AgentsView bridge — DISABLED by default for privacy. When enabled, finished
-# worker attempts are exported as local Pi session files (written with private
-# permissions) so AgentsView can display sub-agent sessions. Nothing is sent
-# anywhere; everything stays under exportDir on this machine.
-# To opt in: set enabled: true, then register exportDir with AgentsView via a
-# [[session_sources]] entry in ~/.agentsview/config.toml (verified with
-# AgentsView v0.41.1):
-#
-#   [[session_sources]]
-#   agent = "pi"
-#   dir = "~/.pi/orchestrator/agentsview-sessions"
-#
-# (see README → AgentsView integration).
-agentsView:
-  enabled: false
-  exportDir: ~/.pi/orchestrator/agentsview-sessions

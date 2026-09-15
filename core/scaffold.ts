@@ -13,8 +13,7 @@
  *   - Directories are created with 0700, files written with 0600 where the OS
  *     supports POSIX permissions (best-effort, never fatal).
  *   - Template paths are validated so they cannot escape their roots.
- *   - Copies only the bundled templates — never reads or copies user secrets,
- *     and never mutates any AgentsView configuration.
+ *   - Copies only the bundled templates — never reads or copies user secrets.
  */
 
 import * as fs from "node:fs";

@@ -21,7 +21,6 @@
 		"pi",
 		"multi-agent",
 		"orchestrator",
-		"agentsview",
 		"typescript"
 	],
 	"scripts": {

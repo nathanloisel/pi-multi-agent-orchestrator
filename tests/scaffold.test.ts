@@ -40,7 +40,9 @@ describe("scaffold", () => {
 			}
 			// Contents come from the bundled templates (no local paths, no secrets).
 			const config = fs.readFileSync(path.join(root, "orchestrator/config.yaml"), "utf-8");
-			assert.match(config, /agentsView:\s*\n\s*enabled: false/);
+			for (const section of ["concurrency", "budgets", "routing"]) {
+				assert.match(config, new RegExp(`^${section}:`, "m"), `scaffolded config should configure ${section}`);
+			}
 			const models = yamlParse(fs.readFileSync(path.join(root, "orchestrator/models.yaml"), "utf-8")) as {
 				models: Record<string, { provider: string; model: string }>;
 				defaults: { worker: string };
