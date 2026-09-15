@@ -318,8 +318,12 @@ export class Orchestrator {
 	 * DAG execution (§11): run all non-terminal jobs whose dependencies are
 	 * satisfied; independent jobs execute concurrently under the concurrency
 	 * gates. Failed/cancelled dependencies propagate "failed" downstream.
+	 *
+	 * onJobUpdate fires once per job as it settles — even inside a parallel
+	 * batch — so callers can stream partial tool results. Observer exceptions
+	 * are isolated and never affect job outcomes.
 	 */
-	async runGraph(agents: AgentConfig[], opts: { signal?: AbortSignal; jobIds?: string[] } = {}): Promise<RunReport[]> {
+	async runGraph(agents: AgentConfig[], opts: { signal?: AbortSignal; jobIds?: string[]; onJobUpdate?: (report: RunReport) => void } = {}): Promise<RunReport[]> {
 		const reports: RunReport[] = [];
 		for (;;) {
 			const jobs = this.store.listJobs().map((j) => this.store.recoverInterrupted(j));
@@ -360,9 +364,11 @@ export class Orchestrator {
 				if (statusIsTerminal(j.status) || j.status === "running" || j.status === "interrupted") return false;
 				return effectiveStatus(j, byId) === "ready";
 			});
-			if (runnable.length === 0) break;
 
-			// mark blocked-with-failed-deps as failed (propagation)
+			// mark blocked-with-failed-deps as failed (propagation) — runs even on
+			// the final pass so persisted state converges (matches graph() self-
+			// healing) and dependency-gated failures reach progress observers.
+			const propagated: JobRecord[] = [];
 			for (const j of jobs) {
 				if (statusIsTerminal(j.status)) continue;
 				const depFailed = j.dependsOn.some((d) => {
@@ -375,8 +381,26 @@ export class Orchestrator {
 					j.completedAt = Date.now();
 					this.store.writeJob(j);
 					byId.set(j.jobId, j); // propagate transitively within this pass
+					propagated.push(j);
 					this.events.append(j.jobId, "job.failed", { reason: "dependency_failed" });
 				}
+			}
+			// dependency-gated failures never execute an attempt, but they ARE
+			// transitions: report them so partial results stay truthful.
+			if (opts.onJobUpdate) {
+				for (const j of propagated) {
+					try {
+						opts.onJobUpdate(this.derivedReport(j));
+					} catch {
+						/* progress observers must never affect job outcomes */
+					}
+				}
+			}
+			if (runnable.length === 0) {
+				// nothing to execute; loop only if propagation changed state so its
+				// own downstream effects are resolved (then terminate)
+				if (propagated.length === 0) break;
+				continue;
 			}
 
 			const batch = await Promise.allSettled(
@@ -385,7 +409,15 @@ export class Orchestrator {
 					this.cancels.set(job.jobId, controller);
 					const combined = combineSignals(controller.signal, opts.signal);
 					try {
-						return await this.runJobInternal(job, agents, { signal: combined });
+						const report = await this.runJobInternal(job, agents, { signal: combined });
+						if (opts.onJobUpdate) {
+							try {
+								opts.onJobUpdate(report);
+							} catch {
+								/* progress observers must never affect job outcomes */
+							}
+						}
+						return report;
 					} finally {
 						this.cancels.delete(job.jobId);
 					}
@@ -398,10 +430,25 @@ export class Orchestrator {
 		return reports;
 	}
 
-	async waitJobs(jobIds: string[], timeoutMs = 300000, signal?: AbortSignal): Promise<JobRecord[]> {
+	/** Poll persisted job state until every id is terminal (or timeout). If
+	 * onPoll is given it fires on every STATUS CHANGE (including once upfront)
+	 * so callers can stream progress; observer exceptions are isolated. */
+	async waitJobs(jobIds: string[], timeoutMs = 300000, signal?: AbortSignal, onPoll?: (jobs: JobRecord[]) => void): Promise<JobRecord[]> {
 		const deadline = Date.now() + timeoutMs;
+		let lastSig = "";
 		for (;;) {
 			const jobs = jobIds.map((id) => this.readJob(id)).filter((j): j is JobRecord => Boolean(j));
+			if (onPoll) {
+				const sig = jobs.map((j) => `${j.jobId}:${j.status}`).join(",");
+				if (sig !== lastSig) {
+					lastSig = sig;
+					try {
+						onPoll(jobs);
+					} catch {
+						/* progress observers must never affect waiting */
+					}
+				}
+			}
 			if (jobs.every((j) => statusIsTerminal(j.status) || j.status === "interrupted" || j.status === "waiting")) return jobs;
 			if (Date.now() > deadline) return jobs;
 			await sleep(500, signal);
@@ -409,6 +456,17 @@ export class Orchestrator {
 	}
 
 	// ── Internals ────────────────────────────────────────────────────────────
+
+	/** A RunReport derived purely from persisted state (no attempt executed) —
+	 * used to report dependency-gated transitions to progress observers. */
+	private derivedReport(job: JobRecord): RunReport {
+		return {
+			jobId: job.jobId,
+			status: job.status,
+			attempts: this.store.listAttempts(job.jobId),
+			summaryForOrchestrator: `job: ${job.jobId}\njobStatus: ${job.status}\n${(job.lastBlockers ?? []).join("; ")}`.trimEnd(),
+		};
+	}
 
 	private requireJob(jobId: string): JobRecord {
 		const job = this.readJob(jobId);
@@ -782,8 +840,9 @@ export class Orchestrator {
 			job.status = "success";
 			job.completedAt = Date.now();
 			cleanupWorkspace(workspace, agent.workspace.cleanup ?? "keep", true);
-			this.events.append(job.jobId, "job.completed", { attempts: job.attemptCount });
+			// persist BEFORE the event so event observers always read final truth
 			this.store.writeJob(job);
+			this.events.append(job.jobId, "job.completed", { attempts: job.attemptCount });
 		} else if (attempt.status === "cancelled") {
 			job.status = "cancelled";
 			job.completedAt = Date.now();

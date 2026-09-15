@@ -166,6 +166,34 @@ Batch with dependencies (DAG):
 > serializer depending on the parser, then the CLI wiring depending on both.
 > Each must pass `npm run typecheck`.
 
+### 6. Watch it work
+
+While jobs run, a live progress display shows tool calls and job state in
+real time; the main agent's visible messages complement it — terse, factual,
+and never repeating what the display already shows:
+
+- **Plan** — a short numbered plan for multi-step work (one line per step/job);
+  trivial single-step requests skip ceremony entirely.
+- **Now:** — only at meaningful execution transitions (new batch of jobs, new
+  phase, changed approach): one line naming the job(s) and targets. Skipped
+  when the live display already makes the transition obvious.
+- **Plan update:** — only when steps are added, removed, reordered, replaced,
+  or a blocker changes the approach, with a one-line reason. Step numbering is
+  stable, every parallel job keeps its own identifiable label (one line
+  listing them is fine), and completed/cancelled steps remain listed with
+  their terminal state.
+- **Final message** — outcome, relevant paths, and actual validation results
+  or blockers.
+
+No filler, no plan dumps between tool calls, and no step is called done before
+its job returned a validated result.
+
+The live display itself is a bounded **Plan** widget (above the editor, with a
+status line) driven by persisted job state: only jobs from the current session
+branch appear, `Now:` names actually running work, and finished history is
+capped with truthful overflow lines. It is re-projected on session switch and
+cleared on `/reload` (see [Troubleshooting](#troubleshooting)).
+
 ## Tools
 
 ### `delegate`

@@ -41,8 +41,21 @@ export interface OrchestratorEvent {
 	data?: Record<string, unknown>;
 }
 
+export type EventListener = (event: OrchestratorEvent) => void;
+
 export class EventLog {
+	private listeners = new Set<EventListener>();
+
 	constructor(private readonly jobsDir: string) {}
+
+	/** Observe in-process job/attempt transitions (live UI seam). Listener
+	 * exceptions are isolated — a progress observer can never affect a job. */
+	onEvent(listener: EventListener): () => void {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	}
 
 	private file(jobId: string): string {
 		return path.join(this.jobsDir, jobId, "events.jsonl");
@@ -55,6 +68,13 @@ export class EventLog {
 			fs.appendFileSync(this.file(jobId), `${JSON.stringify(event)}\n`);
 		} catch {
 			/* never fail a job because of the audit log */
+		}
+		for (const listener of this.listeners) {
+			try {
+				listener(event);
+			} catch {
+				/* never fail a job because of an observer */
+			}
 		}
 	}
 

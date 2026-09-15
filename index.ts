@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -30,6 +30,15 @@ import { rosterText, orchestratorPrompt } from "./core/prompts.ts";
 import { ModelRegistry } from "./core/models.ts";
 import { Router, type RoutingRule } from "./core/routing.ts";
 import { JobStore, readJson } from "./core/storage.ts";
+import {
+	collectMembershipJobIds,
+	ProgressTracker,
+	progressStatusText,
+	PROGRESS_MEMBERSHIP_ENTRY_TYPE,
+	renderProgress,
+	stateFromEventType,
+	type ProgressTask,
+} from "./core/progress.ts";
 import { EventLog } from "./core/events.ts";
 import { AgentsViewExporter } from "./core/agentsview.ts";
 import { BudgetManager } from "./core/budget.ts";
@@ -42,6 +51,8 @@ import { DEFAULT_CONCURRENCY, type ConcurrencyConfig, type ContextPack, type Job
 const ORCHESTRATOR_TOOLS = new Set(["delegate", "jobs"]);
 const MAX_PARALLEL_TASKS = 16;
 const SUMMARY_CAP = 4 * 1024;
+const PROGRESS_WIDGET_ID = "orchestrator-progress";
+const PROGRESS_STATUS_KEY = "orchestrator";
 
 const HERE = typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
 
@@ -96,6 +107,156 @@ export default function (pi: ExtensionAPI) {
 	let orch: Orchestrator | null = null;
 	let registry: ModelRegistry | null = null;
 	let plannerTelemetry: PlannerTelemetryCollector | null = null;
+
+	// ── Live progress (Plan widget) — a projection of persisted job state ──
+	let tracker = new ProgressTracker();
+	let uiCtx: ExtensionContext | null = null;
+	let unlistenProgress: (() => void) | null = null;
+	const membershipLogged = new Set<string>();
+
+	/** Persist job MEMBERSHIP for this session branch (ids only — never a
+	 * second copy of job state). Restore scans branch entries only, so two
+	 * main sessions in the same cwd never inherit each other's jobs. */
+	function appendMembership(jobIds: string[]): void {
+		const fresh = jobIds.filter((id) => !membershipLogged.has(id));
+		if (fresh.length === 0) return;
+		try {
+			for (const id of fresh) membershipLogged.add(id);
+			pi.appendEntry(PROGRESS_MEMBERSHIP_ENTRY_TYPE, { jobIds: fresh });
+		} catch {
+			/* membership persistence is best effort */
+		}
+	}
+
+	/** Track a job explicitly referenced by this session (jobs.wait/retry/
+	 * followup on an older job): sync its persisted state into the projection
+	 * and record membership. Raw store read — side-effect-free, no recovery. */
+	function trackExplicitJob(jobId: string): void {
+		try {
+			const job = orch?.store.readJob(jobId);
+			if (!job) return;
+			if (tracker.sync([job])) refreshProgressUI();
+			appendMembership([jobId]);
+		} catch {
+			/* best effort */
+		}
+	}
+
+	/** Restore tracked jobs from the CURRENT branch's membership entries only.
+	 * Raw store.readJob per id (no listJobs — its recovery mutates state),
+	 * finished included within the display budget (tracker prunes). */
+	function restoreProgressFromBranch(ctx: ExtensionContext): void {
+		try {
+			const ids = collectMembershipJobIds(ctx.sessionManager.getBranch() as readonly unknown[]);
+			for (const id of ids) membershipLogged.add(id);
+			const jobs = ids
+				.map((id) => orch?.store.readJob(id))
+				.filter((j): j is JobRecord => Boolean(j));
+			tracker.sync(jobs);
+			// Always refresh: the caller just reset the tracker, so an empty result
+			// must CLEAR stale widget lines from a previous branch/session too.
+			refreshProgressUI();
+		} catch {
+			/* progress restore must never break session start */
+		}
+	}
+
+	function paintProgressTask(task: ProgressTask, line: string): string {
+		const theme = uiCtx?.ui?.theme;
+		if (!theme) return line;
+		try {
+			switch (task.state) {
+				case "running":
+					return theme.fg("accent", line);
+				case "done":
+					return theme.fg("success", line);
+				case "failed":
+					return theme.fg("error", line);
+				case "blocked":
+					return theme.fg("warning", line);
+				case "cancelled":
+					return theme.fg("dim", line);
+				default:
+					return line;
+			}
+		} catch {
+			return line;
+		}
+	}
+
+	function refreshProgressUI(): void {
+		const ctx = uiCtx;
+		if (!ctx) return;
+		try {
+			if (!ctx.hasUI) return;
+			const tasks = tracker.snapshot();
+			const lines = renderProgress(tasks, { paint: paintProgressTask });
+			if (lines.length === 0) {
+				ctx.ui.setWidget(PROGRESS_WIDGET_ID, undefined);
+				ctx.ui.setStatus(PROGRESS_STATUS_KEY, undefined);
+			} else {
+				ctx.ui.setWidget(PROGRESS_WIDGET_ID, lines, { placement: "aboveEditor" });
+				ctx.ui.setStatus(PROGRESS_STATUS_KEY, progressStatusText(tasks));
+			}
+		} catch {
+			/* progress UI must never break orchestration */
+		}
+	}
+
+	/** Observe in-process runtime transitions via the EventLog seam and project
+	 * them into the widget. Tracked jobs = restored branch membership + jobs
+	 * created by this session's own tool calls; every other session's jobs are
+	 * invisible. Side-effect-free: raw store reads only. */
+	function attachProgressListener(): void {
+		if (!orch || unlistenProgress) return;
+		unlistenProgress = orch.events.onEvent((event) => {
+			try {
+				if (event.type !== "job.created" && !tracker.has(event.jobId)) return;
+				// Raw persisted state only — never orch.readJob(), whose crash
+				// recovery would falsely mark a legitimately running attempt as
+				// interrupted. EventLog appends happen after the matching state
+				// write, so the projection is always current.
+				const job = orch?.store.readJob(event.jobId);
+				if (job && tracker.sync([job])) refreshProgressUI();
+			} catch {
+				/* observer isolation: UI state never affects jobs */
+			}
+		});
+	}
+
+	function resetProgress(): void {
+		unlistenProgress?.();
+		unlistenProgress = null;
+		tracker = new ProgressTracker();
+		membershipLogged.clear();
+	}
+
+	/** Stream real transition states for a single job into the tool's partial
+	 * result. Only states CONFIRMED by runtime events are emitted ("running"
+	 * only after attempt.started — never before the scheduler); terminal truth
+	 * arrives via the final tool report. Exceptions isolated. */
+	function streamJobEvents(o: Orchestrator, jobId: string, onUpdate: ((u: { content: { type: "text"; text: string }[]; details?: unknown }) => void) | undefined): () => void {
+		let last: string | null = "queued"; // callers already announce the queued baseline
+		return o.events.onEvent((event) => {
+			if (event.jobId !== jobId) return;
+			const state = stateFromEventType(event.type);
+			if (!state || state === last) return;
+			last = state;
+			try {
+				onUpdate?.({ content: [{ type: "text", text: `job ${jobId}: ${state}` }], details: { jobId } });
+			} catch {
+				/* progress UI must never affect jobs */
+			}
+		});
+	}
+
+	/** Adapter from pi's tool onUpdate callback to the loose streaming shape. */
+	function toolStream(onUpdate: unknown): ((u: { content: { type: "text"; text: string }[]; details?: unknown }) => void) | undefined {
+		if (typeof onUpdate !== "function") return undefined;
+		return (u) => {
+			(onUpdate as (x: unknown) => void)(u);
+		};
+	}
 
 	function buildRuntime(cwd: string, sessionModel?: { provider?: string; model?: string; effort?: string }) {
 		const discovery = discoverAgents(cwd, { includeProject: false });
@@ -171,6 +332,15 @@ export default function (pi: ExtensionAPI) {
 		buildRuntime(ctx.cwd, sessionModel);
 		await loadMainHooks(ctx.cwd);
 
+		// Live progress: fresh projection per session. Restore ONLY job ids
+		// recorded as owned/referenced by THIS branch (membership entries);
+		// finished referenced jobs reappear within the display budget. Same-cwd
+		// other sessions and raw history never leak in. Persisted JobRecords
+		// stay the sole source of truth — the tracker is a display projection.
+		resetProgress();
+		uiCtx = ctx;
+		attachProgressListener();
+		restoreProgressFromBranch(ctx);
 		if (!enforceMain) return;
 
 		const allToolNames = pi.getAllTools().map((tool) => tool.name);
@@ -200,6 +370,28 @@ export default function (pi: ExtensionAPI) {
 			`orchestrator: main locked to delegate/jobs · ${agents.filter((a) => a.role === "sub").length} agents · models: ${registry?.aliases().join(", ") || "(none — using session model)"}`,
 			"info",
 		);
+	});
+
+	// Clear progress UI + observers on teardown (quit, /reload, session swap).
+	pi.on("session_shutdown", async (_event, ctx) => {
+		resetProgress();
+		uiCtx = null;
+		try {
+			if (ctx.hasUI) {
+				ctx.ui.setWidget(PROGRESS_WIDGET_ID, undefined);
+				ctx.ui.setStatus(PROGRESS_STATUS_KEY, undefined);
+			}
+		} catch {
+			/* best effort */
+		}
+	});
+
+	// Branch navigation: re-project from the NEW branch's membership entries.
+	pi.on("session_tree", async (_event, ctx) => {
+		resetProgress();
+		uiCtx = ctx;
+		attachProgressListener();
+		restoreProgressFromBranch(ctx);
 	});
 
 	// Main planner telemetry uses Pi's documented lifecycle. Worker subprocesses
@@ -341,9 +533,26 @@ export default function (pi: ExtensionAPI) {
 				if (hasSingle) {
 					const input = toInput({ ...params, agent: params.agent!, task: params.task! });
 					const job = o.createJob(input, agents);
-					onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId} created (${params.agent}) — running…` }], details: { jobId: job.jobId } });
-					const report = await o.runJob(job, agents, signal);
-					onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId}: ${report.status}` }], details: { jobId: job.jobId } });
+					appendMembership([job.jobId]);
+					try {
+						onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId} created (${params.agent}) — queued` }], details: { jobId: job.jobId } });
+					} catch {
+						/* progress UI must never affect jobs */
+					}
+					// Stream real transitions ("running" only once attempt.started
+					// confirms it); terminal truth arrives via the final report.
+					const unstream = streamJobEvents(o, job.jobId, toolStream(onUpdate));
+					let report: RunReport;
+					try {
+						report = await o.runJob(job, agents, signal);
+					} finally {
+						unstream();
+					}
+					try {
+						onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId}: ${report.status}` }], details: { jobId: job.jobId } });
+					} catch {
+						/* progress UI must never affect jobs */
+					}
 					return renderRunReport(report);
 				}
 
@@ -352,8 +561,30 @@ export default function (pi: ExtensionAPI) {
 				}
 				const created: JobRecord[] = [];
 				for (const j of params.jobs!) created.push(o.createJob(toInput(j), agents));
-				onUpdate?.({ content: [{ type: "text" as const, text: `created ${created.length} jobs — running DAG…` }], details: { jobIds: created.map((c) => c.jobId) } });
-				const reports = await o.runGraph(agents, { signal, jobIds: created.map((c) => c.jobId) });
+				appendMembership(created.map((c) => c.jobId));
+				try {
+					onUpdate?.({ content: [{ type: "text" as const, text: `created ${created.length} jobs — running DAG…` }], details: { jobIds: created.map((c) => c.jobId) } });
+				} catch {
+					/* progress UI must never affect jobs */
+				}
+				// Stream per-job results as they settle so partially-completed batches
+				// are visible while the remaining jobs keep running.
+				const settled: RunReport[] = [];
+				const reports = await o.runGraph(agents, {
+					signal,
+					jobIds: created.map((c) => c.jobId),
+					onJobUpdate: (report) => {
+						try {
+							settled.push(report);
+							onUpdate?.({
+								content: [{ type: "text" as const, text: `DAG progress: ${settled.length}/${created.length} finished — ${report.jobId}: ${report.status}` }],
+								details: { reports: [...settled] } as Record<string, unknown>,
+							});
+						} catch {
+							/* progress UI must never affect jobs */
+						}
+					},
+				});
 				return renderRunReports(reports, created);
 			} catch (e) {
 				const err = e as Error & { detail?: { available?: string[] } };
@@ -415,9 +646,17 @@ export default function (pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({ description: "logical alias override for retry (worker-cheap/worker-best/frontier)" })),
 		}),
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const o = requireOrch(ctx.cwd, ctx.model ? { provider: ctx.model.provider, model: ctx.model.id, effort: ctx.thinkingLevel } : undefined);
 			const t = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} as Record<string, unknown> });
+			// Progress UI must never affect job outcomes.
+			const safeOnUpdate = (update: { content: { type: "text"; text: string }[]; details?: unknown }) => {
+				try {
+					onUpdate?.(update as Parameters<NonNullable<typeof onUpdate>>[0]);
+				} catch {
+					/* observer isolation */
+				}
+			};
 			const needsId = () => t("jobId is required for this action.");
 			try {
 				switch (params.action) {
@@ -485,12 +724,30 @@ export default function (pi: ExtensionAPI) {
 					}
 					case "followup": {
 						if (!params.jobId || !params.message) return t("jobId and message are required.");
-						const report = await o.followupJob(params.jobId, params.message, agents, signal);
+						trackExplicitJob(params.jobId);
+						safeOnUpdate({ content: [{ type: "text", text: `job ${params.jobId}: follow-up requested (queued)` }], details: { jobId: params.jobId } });
+						const unstream = streamJobEvents(o, params.jobId, safeOnUpdate);
+						let report: RunReport;
+						try {
+							report = await o.followupJob(params.jobId, params.message, agents, signal);
+						} finally {
+							unstream();
+						}
+						safeOnUpdate({ content: [{ type: "text", text: `job ${params.jobId}: ${report.status}` }], details: { reports: [report] } });
 						return renderRunReport(report);
 					}
 					case "retry": {
 						if (!params.jobId) return needsId();
-						const report = await o.retryJob(params.jobId, agents, { strategy: params.strategy, model: params.model, reason: "orchestrator retry", signal });
+						trackExplicitJob(params.jobId);
+						safeOnUpdate({ content: [{ type: "text", text: `job ${params.jobId}: retry requested (queued)` }], details: { jobId: params.jobId } });
+						const unstream = streamJobEvents(o, params.jobId, safeOnUpdate);
+						let report: RunReport;
+						try {
+							report = await o.retryJob(params.jobId, agents, { strategy: params.strategy, model: params.model, reason: "orchestrator retry", signal });
+						} finally {
+							unstream();
+						}
+						safeOnUpdate({ content: [{ type: "text", text: `job ${params.jobId}: ${report.status}` }], details: { reports: [report] } });
 						return renderRunReport(report);
 					}
 					case "cancel": {
@@ -500,7 +757,13 @@ export default function (pi: ExtensionAPI) {
 					case "wait": {
 						if (!params.jobId) return needsId();
 						const ids = params.jobId.split(",").map((s) => s.trim()).filter(Boolean);
-						const jobs = await o.waitJobs(ids, 300000, signal);
+						for (const id of ids) trackExplicitJob(id);
+						const jobs = await o.waitJobs(ids, 300000, signal, (snapshot) => {
+							safeOnUpdate({
+								content: [{ type: "text", text: `waiting: ${snapshot.map((j) => `${j.jobId}=${j.status}`).join(", ")}` }],
+								details: {},
+							});
+						});
 						return t(jobs.map((j) => `- ${j.jobId}: ${j.status}${j.lastSummary ? ` — ${j.lastSummary.slice(0, 120)}` : ""}`).join("\n"));
 					}
 					case "metrics": {
