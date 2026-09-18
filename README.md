@@ -168,12 +168,21 @@ Batch with dependencies (DAG):
 
 ### 6. Watch it work
 
+When a request is not straightforward, the orchestrator resolves the ambiguity
+before delegating: it reads the existing code first, explains what already
+exists, and asks one targeted question with concrete options when materially
+different interpretations would change behavior, scope, or design. Read-only
+research may continue while it waits, but implementation does not start until
+you answer.
+
 While jobs run, a live progress display shows tool calls and job state in
 real time; the main agent's visible messages complement it — terse, factual,
 and never repeating what the display already shows:
 
 - **Plan** — a short numbered plan for multi-step work (one line per step/job);
-  trivial single-step requests skip ceremony entirely.
+  the same steps are published first with `jobs action=plan` (the authoritative
+  structured snapshot, with a branch-local revision) and trivial single-step
+  requests skip ceremony entirely. See [PLAN-CONTRACT.md](./PLAN-CONTRACT.md).
 - **Now:** — only at meaningful execution transitions (new batch of jobs, new
   phase, changed approach): one line naming the job(s) and targets. Skipped
   when the live display already makes the transition obvious.
@@ -188,11 +197,13 @@ and never repeating what the display already shows:
 No filler, no plan dumps between tool calls, and no step is called done before
 its job returned a validated result.
 
-The live display itself is a bounded **Plan** widget (above the editor, with a
-status line) driven by persisted job state: only jobs from the current session
-branch appear, `Now:` names actually running work, and finished history is
-capped with truthful overflow lines. It is re-projected on session switch and
-cleared on `/reload` (see [Troubleshooting](#troubleshooting)).
+The live display itself is a projection of persisted job state: plan and
+per-job detail render in the pi-workspace/desk side panel, while the
+orchestrator itself contributes only a compact **footer status**
+(`orchestrator`: `N running · M pending · D/T done`). Without the workspace,
+that footer is the entire display — there is no above-editor Plan block. Only
+jobs from the current session branch appear, and the footer is re-projected on
+session switch and cleared on `/reload` (see [Troubleshooting](#troubleshooting)).
 
 ## Tools
 
@@ -219,6 +230,7 @@ cleared on `/reload` (see [Troubleshooting](#troubleshooting)).
 | `retry <id>[,strategy][,model]` | New attempt (`fresh` or `resume`, optional escalation) |
 | `cancel <id>` | Cancel a non-terminal job |
 | `wait <id>[,id…]` | Block until jobs settle |
+| `plan steps=[…]` | Publish/revise the structured early plan (branch-local revision, omitted steps retained) |
 | `metrics` | Planner + per-agent×alias worker totals |
 
 ### Commands

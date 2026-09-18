@@ -417,3 +417,435 @@ export const DEFAULT_RETRY: RetrySpec = {
 };
 
 export const DEFAULT_CONCURRENCY: ConcurrencyConfig = { global: 4, byModel: {} };
+
+// ── Structured plan publication (orchestrator.plan) ────────────────────────
+//
+// The main agent publishes its structured early plan as a complete, immutable
+// Pi session custom entry (`orchestrator.plan`) on the CURRENT branch. Each
+// entry is a full snapshot (never a patch), so the latest valid entry on a
+// branch is the entire plan — no cross-session cache or filesystem store is
+// needed. See PLAN-CONTRACT.md for the consumer contract.
+//
+// A deliberate mismatch with the sibling plan-protocol: this is the minimal
+// producer wire shape the orchestrator can emit today with no new tool and no
+// future schema requirement. It carries declared plan state; live job state
+// stays in the JobRecord store and is joined by explicit `jobIds` / membership
+// bindings.
+
+export const PLAN_ENTRY_TYPE = "orchestrator.plan";
+export const PLAN_SCHEMA_VERSION = 1 as const;
+
+/** Hard bounds so a single plan can never grow unbounded. */
+export const MAX_PLAN_STEPS = 64;
+export const MAX_PLAN_TITLE_CHARS = 120;
+export const MAX_PLAN_ID_CHARS = 80;
+export const MAX_PLAN_REF_CHARS = 80;
+export const MAX_PLAN_REFS = 64;
+
+export const PLAN_STEP_STATUSES = ["planned", "running", "completed", "failed", "blocked", "cancelled", "superseded"] as const;
+export type PlanStepStatus = (typeof PLAN_STEP_STATUSES)[number];
+
+/** One declared plan step. `agent` is optional and never defaulted. */
+export interface PlanStep {
+	id: string;
+	title: string;
+	agent?: string;
+	dependsOn: string[];
+	jobIds: string[];
+	status: PlanStepStatus;
+}
+
+/** The exact custom-entry payload persisted under `orchestrator.plan`. */
+export interface PlanSnapshot {
+	version: typeof PLAN_SCHEMA_VERSION;
+	planId: string;
+	revision: number;
+	steps: PlanStep[];
+}
+
+/** Stable job↔step association recorded in the progress membership entry. */
+export interface PlanJobBinding {
+	jobId: string;
+	stepId: string;
+}
+
+export type PlanRevisionResult = { ok: true; snapshot: PlanSnapshot } | { ok: false; errors: string[] };
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Normalize an id array: absent → [], otherwise unique non-empty bounded strings. */
+function normalizeRefArray(value: unknown): string[] | null {
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value) || value.length > MAX_PLAN_REFS) return null;
+	const out: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string") return null;
+		const id = entry.trim();
+		if (!id || id.length > MAX_PLAN_REF_CHARS || out.includes(id)) return null;
+		out.push(id);
+	}
+	return out;
+}
+
+/** Collect a reference array while pushing human-readable validation errors. */
+function validateRefArray(value: unknown, field: string, errors: string[]): string[] | null {
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value)) {
+		errors.push(`${field} must be an array of strings`);
+		return null;
+	}
+	if (value.length > MAX_PLAN_REFS) {
+		errors.push(`${field} exceeds ${MAX_PLAN_REFS} entries`);
+		return null;
+	}
+	const out: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string") {
+			errors.push(`${field} entries must be strings`);
+			return null;
+		}
+		const id = entry.trim();
+		if (!id) {
+			errors.push(`${field} entries must not be empty`);
+			return null;
+		}
+		if (id.length > MAX_PLAN_REF_CHARS) {
+			errors.push(`${field} entries exceed ${MAX_PLAN_REF_CHARS} characters`);
+			return null;
+		}
+		if (out.includes(id)) {
+			errors.push(`${field} contains duplicate ${id}`);
+			return null;
+		}
+		out.push(id);
+	}
+	return out;
+}
+
+/** Cycle detection over step.dependsOn. Returns the cycle path, or null. */
+function findDependencyCycle(steps: readonly PlanStep[]): string[] | null {
+	const byId = new Map(steps.map((s) => [s.id, s]));
+	const state = new Map<string, 0 | 1 | 2>();
+	const stack: string[] = [];
+	let cycle: string[] | null = null;
+	const visit = (id: string): boolean => {
+		const current = state.get(id) ?? 0;
+		if (current === 1) {
+			const start = stack.indexOf(id);
+			cycle = [...stack.slice(start), id];
+			return true;
+		}
+		if (current === 2) return false;
+		state.set(id, 1);
+		stack.push(id);
+		for (const dep of byId.get(id)?.dependsOn ?? []) {
+			if (byId.has(dep) && visit(dep)) return true;
+		}
+		stack.pop();
+		state.set(id, 2);
+		return false;
+	};
+	for (const step of steps) {
+		if (visit(step.id)) break;
+	}
+	return cycle;
+}
+
+/**
+ * Strictly parse a persisted snapshot. Returns null for ANY malformed shape
+ * (bad version, missing fields, duplicate ids, unknown/cyclic dependencies) so
+ * callers can skip malformed historical entries instead of throwing.
+ */
+export function normalizePlanSnapshot(raw: unknown): PlanSnapshot | null {
+	if (!isPlainRecord(raw)) return null;
+	if (raw.version !== PLAN_SCHEMA_VERSION) return null;
+	if (typeof raw.planId !== "string") return null;
+	const planId = raw.planId.trim();
+	if (!planId || planId.length > MAX_PLAN_ID_CHARS) return null;
+	if (typeof raw.revision !== "number" || !Number.isInteger(raw.revision) || raw.revision < 1) return null;
+	if (!Array.isArray(raw.steps) || raw.steps.length === 0 || raw.steps.length > MAX_PLAN_STEPS) return null;
+
+	const steps: PlanStep[] = [];
+	const seen = new Set<string>();
+	for (const candidate of raw.steps) {
+		if (!isPlainRecord(candidate)) return null;
+		if (typeof candidate.id !== "string" || typeof candidate.title !== "string") return null;
+		const id = candidate.id.trim();
+		const title = candidate.title.replace(/\s+/g, " ").trim();
+		if (!id || id.length > MAX_PLAN_REF_CHARS || seen.has(id)) return null;
+		if (!title || title.length > MAX_PLAN_TITLE_CHARS) return null;
+		if (candidate.agent !== undefined && (typeof candidate.agent !== "string" || candidate.agent.trim().length === 0 || candidate.agent.length > MAX_PLAN_REF_CHARS)) return null;
+		const dependsOn = normalizeRefArray(candidate.dependsOn);
+		const jobIds = normalizeRefArray(candidate.jobIds);
+		if (!dependsOn || !jobIds) return null;
+		if (typeof candidate.status !== "string" || !PLAN_STEP_STATUSES.includes(candidate.status as PlanStepStatus)) return null;
+		seen.add(id);
+		const step: PlanStep = { id, title, dependsOn, jobIds, status: candidate.status as PlanStepStatus };
+		if (typeof candidate.agent === "string" && candidate.agent.trim()) step.agent = candidate.agent.trim();
+		steps.push(step);
+	}
+
+	for (const step of steps) {
+		for (const dep of step.dependsOn) if (!seen.has(dep)) return null;
+	}
+	if (findDependencyCycle(steps)) return null;
+
+	return { version: PLAN_SCHEMA_VERSION, planId, revision: raw.revision, steps };
+}
+
+/**
+ * Build the next branch-local plan revision from a `jobs action=plan` call.
+ *
+ * Retention rule: supplied steps replace same-id definitions in place and new
+ * ids append; every omitted previous step is retained verbatim, so steps can
+ * never silently disappear. Validation is exhaustive and happens before any
+ * append (atomic). `revision` is always previous + 1 (or 1 for the first).
+ */
+export function buildPlanSnapshot(opts: { previous: PlanSnapshot | null; planId?: unknown; steps: unknown }): PlanRevisionResult {
+	const errors: string[] = [];
+	const previous = opts.previous;
+
+	let suppliedPlanId: string | undefined;
+	if (opts.planId !== undefined) {
+		if (typeof opts.planId !== "string") errors.push("planId must be a string");
+		else {
+			const clean = opts.planId.trim();
+			if (!clean) errors.push("planId must not be empty");
+			else if (clean.length > MAX_PLAN_ID_CHARS) errors.push(`planId exceeds ${MAX_PLAN_ID_CHARS} characters`);
+			else suppliedPlanId = clean;
+		}
+	}
+	if (suppliedPlanId && previous && suppliedPlanId !== previous.planId) {
+		errors.push(`planId cannot change within a branch (current: ${previous.planId})`);
+	}
+	const planId = suppliedPlanId ?? previous?.planId ?? "plan";
+
+	if (!Array.isArray(opts.steps) || opts.steps.length === 0) {
+		return { ok: false, errors: [...errors, "steps must be a non-empty array"] };
+	}
+	if (opts.steps.length > MAX_PLAN_STEPS) {
+		return { ok: false, errors: [...errors, `steps exceeds ${MAX_PLAN_STEPS} entries`] };
+	}
+
+	const inputs: PlanStep[] = [];
+	const suppliedIds = new Set<string>();
+	for (let i = 0; i < opts.steps.length; i++) {
+		const label = `steps[${i}]`;
+		const raw = opts.steps[i];
+		if (!isPlainRecord(raw)) {
+			errors.push(`${label} must be an object`);
+			continue;
+		}
+		if (typeof raw.id !== "string") {
+			errors.push(`${label}.id must be a string`);
+			continue;
+		}
+		const id = raw.id.replace(/[\r\n\t]+/g, " ").trim();
+		if (!id) {
+			errors.push(`${label}.id must not be empty`);
+			continue;
+		}
+		if (id.length > MAX_PLAN_REF_CHARS) {
+			errors.push(`${label}.id exceeds ${MAX_PLAN_REF_CHARS} characters`);
+			continue;
+		}
+		if (suppliedIds.has(id)) {
+			errors.push(`duplicate step id: ${id}`);
+			continue;
+		}
+		if (typeof raw.title !== "string") {
+			errors.push(`${label}.title must be a string`);
+			continue;
+		}
+		const title = raw.title.replace(/\s+/g, " ").trim();
+		if (!title) {
+			errors.push(`${label}.title must not be empty`);
+			continue;
+		}
+		if (title.length > MAX_PLAN_TITLE_CHARS) {
+			errors.push(`${label}.title exceeds ${MAX_PLAN_TITLE_CHARS} characters`);
+			continue;
+		}
+		let agent: string | undefined;
+		if (raw.agent !== undefined) {
+			if (typeof raw.agent !== "string") {
+				errors.push(`${label}.agent must be a string`);
+				continue;
+			}
+			const cleanAgent = raw.agent.replace(/[\r\n\t]+/g, " ").trim();
+			if (cleanAgent) {
+				if (cleanAgent.length > MAX_PLAN_REF_CHARS) {
+					errors.push(`${label}.agent exceeds ${MAX_PLAN_REF_CHARS} characters`);
+					continue;
+				}
+				agent = cleanAgent;
+			}
+		}
+		const dependsOn = validateRefArray(raw.dependsOn, `${label}.dependsOn`, errors);
+		const jobIds = validateRefArray(raw.jobIds, `${label}.jobIds`, errors);
+		if (dependsOn === null || jobIds === null) continue;
+		let status: PlanStepStatus = "planned";
+		if (raw.status !== undefined) {
+			if (typeof raw.status !== "string" || !PLAN_STEP_STATUSES.includes(raw.status as PlanStepStatus)) {
+				errors.push(`${label}.status must be one of ${PLAN_STEP_STATUSES.join(", ")}`);
+				continue;
+			}
+			status = raw.status as PlanStepStatus;
+		}
+		suppliedIds.add(id);
+		const step: PlanStep = { id, title, dependsOn, jobIds, status };
+		if (agent) step.agent = agent;
+		inputs.push(step);
+	}
+
+	if (errors.length > 0) return { ok: false, errors };
+
+	const merged: PlanStep[] = previous
+		? previous.steps.map((step) => ({ ...step, dependsOn: [...step.dependsOn], jobIds: [...step.jobIds] }))
+		: [];
+	for (const input of inputs) {
+		const index = merged.findIndex((step) => step.id === input.id);
+		if (index >= 0) merged[index] = input;
+		else merged.push(input);
+	}
+	if (merged.length > MAX_PLAN_STEPS) {
+		return { ok: false, errors: [`plan exceeds ${MAX_PLAN_STEPS} steps after retention (${merged.length})`] };
+	}
+
+	const ids = new Set(merged.map((step) => step.id));
+	for (const step of merged) {
+		for (const dep of step.dependsOn) {
+			if (!ids.has(dep)) errors.push(`step ${step.id} depends on unknown step ${dep}`);
+		}
+	}
+	if (errors.length > 0) return { ok: false, errors };
+	const cycle = findDependencyCycle(merged);
+	if (cycle) return { ok: false, errors: [`dependency cycle: ${cycle.join(" → ")}`] };
+
+	return {
+		ok: true,
+		snapshot: { version: PLAN_SCHEMA_VERSION, planId, revision: (previous?.revision ?? 0) + 1, steps: merged },
+	};
+}
+
+/** Inputs for the automatic plan fallback: one freshly created job. Derived
+ * from created JobRecords BEFORE any run starts. */
+export interface AutoPlanJobInput {
+	jobId: string;
+	agent: string;
+	objective: string;
+	dependsOn: readonly string[];
+	/** Optional explicit title from the delegate call. */
+	title?: string;
+}
+
+/** A new plan step produced by the automatic fallback (before validation). */
+export interface AutoPlanStepInput {
+	id: string;
+	title: string;
+	agent: string;
+	dependsOn: string[];
+	jobIds: string[];
+}
+
+export interface AutoPlanDerivation {
+	steps: AutoPlanStepInput[];
+	diagnostics: string[];
+}
+
+/** Clean a delegate title/objective into a bounded single-line plan title.
+ * Prefers an explicit title; otherwise uses the first sentence of the
+ * objective (markdown bullets/numbering and leading headings stripped). */
+export function deriveAutoPlanTitle(explicit: string | undefined, objective: string): string {
+	const hasExplicit = typeof explicit === "string" && explicit.trim().length > 0;
+	// For an objective, use the first non-empty line; an explicit title is whole.
+	const source = hasExplicit ? explicit! : (objective.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "");
+	let title = source.replace(/\s+/g, " ").trim();
+	for (let i = 0; i < 3; i++) {
+		const next = title
+			.replace(/^#+\s*/, "")
+			.replace(/^[-*]\s+/, "")
+			.replace(/^\d+[.)]\s*/, "")
+			.trimStart();
+		if (next === title) break;
+		title = next;
+	}
+	title = title.trim();
+	if (!hasExplicit) {
+		const sentence = title.match(/^[^.!?]*[.!?]/)?.[0]?.trim();
+		if (sentence) title = sentence;
+	}
+	if (!title) return "job";
+	return title.length > MAX_PLAN_TITLE_CHARS ? `${title.slice(0, MAX_PLAN_TITLE_CHARS - 1).trimEnd()}…` : title;
+}
+
+/** Derive the minimal set of NEW plan steps for freshly created jobs when the
+ * model omitted `jobs action=plan`. Explicit plan steps always win: a job that
+ * is already represented (same step id, or listed in some step's jobIds) gets
+ * no new step, and existing titles/statuses are never touched. Dependencies
+ * are emitted only when they resolve to a step that is or will be in the plan,
+ * so a generated plan can never dangle or cycle. */
+export function deriveAutoPlanSteps(opts: { previous: PlanSnapshot | null; jobs: readonly AutoPlanJobInput[] }): AutoPlanDerivation {
+	const existingStepIds = new Set<string>();
+	const representedJobIds = new Set<string>();
+	for (const step of opts.previous?.steps ?? []) {
+		existingStepIds.add(step.id);
+		representedJobIds.add(step.id);
+		for (const jobId of step.jobIds) representedJobIds.add(jobId);
+	}
+	const newStepIds = new Set(opts.jobs.filter((job) => !representedJobIds.has(job.jobId)).map((job) => job.jobId));
+	const validDependencyIds = new Set([...existingStepIds, ...newStepIds]);
+	const diagnostics: string[] = [];
+	const steps: AutoPlanStepInput[] = [];
+	for (const job of opts.jobs) {
+		if (representedJobIds.has(job.jobId)) continue;
+		const dependsOn: string[] = [];
+		for (const dep of job.dependsOn) {
+			if (validDependencyIds.has(dep)) {
+				if (!dependsOn.includes(dep)) dependsOn.push(dep);
+			} else {
+				diagnostics.push(`dependency "${dep}" of job "${job.jobId}" has no plan step and was omitted`);
+			}
+		}
+		steps.push({ id: job.jobId, title: deriveAutoPlanTitle(job.title, job.objective), agent: job.agent, dependsOn, jobIds: [job.jobId] });
+	}
+	return { steps, diagnostics };
+}
+
+/**
+ * Latest VALID plan snapshot on a branch (root→leaf order). Malformed
+ * historical entries are skipped, never thrown on. Callers pass only the
+ * current branch, so sessions never inherit each other's plans.
+ */
+export function readLatestPlan(branch: readonly unknown[]): PlanSnapshot | null {
+	let latest: PlanSnapshot | null = null;
+	for (const entry of branch) {
+		const candidate = entry as { type?: unknown; customType?: unknown; data?: unknown } | null | undefined;
+		if (!candidate || candidate.type !== "custom" || candidate.customType !== PLAN_ENTRY_TYPE) continue;
+		const parsed = normalizePlanSnapshot(candidate.data);
+		if (parsed) latest = parsed;
+	}
+	return latest;
+}
+
+/** Compact, bounded tool-result summary of a snapshot (live job states optional). */
+export function renderPlanSummary(snapshot: PlanSnapshot, live: Readonly<Record<string, string>> = {}): string {
+	const counts = new Map<PlanStepStatus, number>();
+	for (const step of snapshot.steps) counts.set(step.status, (counts.get(step.status) ?? 0) + 1);
+	const countText = PLAN_STEP_STATUSES.filter((status) => counts.has(status))
+		.map((status) => `${counts.get(status)!} ${status}`)
+		.join(", ");
+	const lines = [`plan "${snapshot.planId}" revision ${snapshot.revision}: ${snapshot.steps.length} step${snapshot.steps.length === 1 ? "" : "s"} (${countText})`];
+	for (const step of snapshot.steps) {
+		const agent = step.agent ? ` [${step.agent}]` : "";
+		const deps = step.dependsOn.length ? ` ⇠ ${step.dependsOn.join(",")}` : "";
+		// Show live job state for explicit jobIds and for an alias-bound step id
+		// (step.id === job.jobId) when that job resolves.
+		const refs = [...new Set([...step.jobIds, ...(live[step.id] !== undefined ? [step.id] : [])])];
+		const jobs = refs.length ? ` · jobs: ${refs.map((jobId) => `${jobId}=${live[jobId] ?? "unknown"}`).join(", ")}` : "";
+		lines.push(`- ${step.id}${agent} ${step.status}${deps} — ${step.title}${jobs}`);
+	}
+	return lines.join("\n");
+}

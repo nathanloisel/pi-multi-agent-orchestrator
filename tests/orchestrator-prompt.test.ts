@@ -83,6 +83,71 @@ describe("orchestratorPrompt — user-visible progress contract", () => {
 	});
 });
 
+describe("orchestratorPrompt — structured plan contract", () => {
+	it("mandates publishing jobs action=plan before the first delegate", () => {
+		assert.match(prompt, /`jobs action=plan` BEFORE the first\s*\n`delegate` call/);
+		assert.match(prompt, /publish the same steps via\s*\n\s*`jobs action=plan` BEFORE the first `delegate`/);
+	});
+
+	it("requires clear human-readable titles and stable step ids equal to the delegate alias", () => {
+		assert.match(prompt, /clear human-readable `title`/);
+		assert.match(prompt, /SAME value for the step id\s*\n\s*and the delegate job alias/);
+	});
+
+	it("requires revisions to retain omitted steps and advance declared status", () => {
+		assert.match(prompt, /omitted steps are\s*\n\s*retained verbatim/);
+		assert.match(prompt, /revision\s*\n\s*number increments/);
+		assert.match(prompt, /Never mark a step `completed` before its\s*\n\s*job returned a validated, passing result/);
+	});
+
+	it("adds plan to the jobs tool surface", () => {
+		assert.match(prompt, /^- jobs: list \| status.*\| plan$/m);
+	});
+});
+
+describe("orchestratorPrompt — clarification policy for consequential ambiguity", () => {
+	it("places the clarification policy between 'Your job' and the structured plan", () => {
+		const job = prompt.indexOf("## Your job");
+		const clarify = prompt.indexOf("## Clarify before consequential ambiguity");
+		const plan = prompt.indexOf("## Structured plan");
+		assert.ok(job >= 0 && clarify > job && plan > clarify, `section order job=${job} clarify=${clarify} plan=${plan}`);
+	});
+
+	it("triggers one targeted question only for genuinely blocking ambiguity", () => {
+		assert.match(prompt, /Not every request is straightforward\./);
+		assert.match(prompt, /Ask ONE concise question, only for a genuinely blocking choice/);
+		assert.match(prompt, /different interpretations affect requested behavior, scope, architecture, UX,\s*\n\s*compatibility, persistence, or a destructive choice/);
+	});
+
+	it("requires read-only discovery of existing behavior before ambiguous modification", () => {
+		assert.match(prompt, /If the uncertainty can be resolved by inspecting the code,\s*\n\s*do that read-only research before asking/);
+		assert.match(prompt, /If the requested capability already exists, or partly\s*\n\s*exists, explain what is already there before editing/);
+	});
+
+	it("allows read-only research but blocks implementation and code/config changes until an answer", () => {
+		assert.match(prompt, /While a question is unanswered, reads,\s*\n\s*searches, and `jobs` inspection are allowed; delegating implementation or changing\s*\n\s*code\/config is not/);
+	});
+
+	it("forbids silently choosing the broader interpretation or presenting inferred design as approved", () => {
+		assert.match(prompt, /Do not silently pick\s*\n\s*the broader interpretation or present an inferred design as already approved/);
+	});
+
+	it("carries the confirmed decision into worker context and acceptance", () => {
+		assert.match(prompt, /Put the confirmed decision into the worker's context and\s*\n\s*acceptance criteria/);
+	});
+
+	it("does not over-question explicit choices, routine details, bug fixes, or code-inferable facts", () => {
+		assert.match(prompt, /Skip the question when the user already chose explicitly, for routine\s*\n\s*local implementation details, for straightforward bug fixes, or for details safely\s*\n\s*inferable from the code/);
+		assert.match(prompt, /stop speculative scope\s*\n\s*expansion and surface the question instead/);
+	});
+
+	it("includes the alias vs concrete-model example and the confirmed 'both' path", () => {
+		assert.match(prompt, /the user asks for "the model" in a header that already shows an alias\./);
+		assert.match(prompt, /keep the\s*\n\s*alias \/ show the concrete model \/ show both/);
+		assert.match(prompt, /If the user answers "both", proceed without repeating it\./);
+	});
+});
+
 describe("orchestratorPrompt — preserved role, delegation, and context rules", () => {
 	it("keeps the enforced planner role and hard tool lockdown", () => {
 		assert.match(prompt, /You are the ORCHESTRATOR/);
