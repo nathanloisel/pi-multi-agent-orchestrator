@@ -45,6 +45,8 @@ export function buildContextPack(opts: BuildContextOpts): BuiltContext {
 		acceptance: opts.context?.acceptance,
 		background: opts.context?.background,
 		previousFailure: opts.context?.previousFailure,
+		dependencies: opts.context?.dependencies,
+		dependenciesOmitted: opts.context?.dependenciesOmitted,
 	};
 
 	const inlined: BuiltContext["inlinedFiles"] = [];

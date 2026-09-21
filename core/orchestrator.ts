@@ -19,7 +19,7 @@ import { ConcurrencyManager } from "./concurrency.ts";
 import { EventLog, type EventType } from "./events.ts";
 import { OrchestratorError } from "./errors.ts";
 import { ModelRegistry, type LaunchConfig } from "./models.ts";
-import { renderEnvelope, type EnvelopeInput } from "./prompts.ts";
+import { renderDependencySection, renderEnvelope, type EnvelopeInput } from "./prompts.ts";
 import { extractResult, persistAttemptResult, renderReportMd, resultSummaryForOrchestrator } from "./result.ts";
 import { Router, type RoutingDecision } from "./routing.ts";
 import { runWorker, type SpawnOutcome, type SpawnRequest } from "./spawn.ts";
@@ -34,6 +34,7 @@ import {
 	type AgentConfig,
 	type AttemptRecord,
 	type ContextPack,
+	type DependencyHandoff,
 	type JobRecord,
 	type JobResult,
 	type JobStatus,
@@ -62,6 +63,47 @@ export interface OrchestratorConfig {
 	workerRunner?: (req: SpawnRequest) => Promise<SpawnOutcome>;
 	agentsViewExporter?: AgentsViewExporter;
 	plannerTelemetry?: PlannerTelemetryStore;
+}
+
+// ── Bounded dependency handoff (automatic, evidence-only) ─────────────────
+// Downstream jobs receive a small handoff from each prerequisite instead of a
+// transcript/source dump: capped summary/findings/changed-paths/artifacts plus
+// an absolute canonical result.json pointer for on-demand detail. The TOTAL
+// size of the rendered section is enforced as an actual UTF-8 byte budget
+// using the same renderer the worker envelope uses, so no estimator can drift.
+const DEP_MAX_RECORDS = 8;
+const DEP_SUMMARY_CHARS = 400;
+const DEP_MAX_FINDINGS = 3;
+const DEP_FINDING_MESSAGE_CHARS = 300;
+const DEP_FINDING_EVIDENCE_CHARS = 300;
+const DEP_MAX_CHANGED_PATHS = 5;
+const DEP_CHANGED_PATH_CHARS = 200;
+const DEP_MAX_ARTIFACTS = 3;
+const DEP_RENDER_BUDGET_BYTES = 24 * 1024;
+
+/** Truncate to a hard maximum length, with a trailing marker when cut. */
+function boundText(value: string | undefined, max: number): string {
+	const text = (value ?? "").trim();
+	if (text.length <= max) return text;
+	return max <= 1 ? text.slice(0, max) : `${text.slice(0, max - 1)}…`;
+}
+
+/**
+ * Select the detail records whose FULL rendered dependency section fits the
+ * UTF-8 byte budget, in order. Measurement uses the exact renderer the worker
+ * envelope uses (never a length estimator). There is no first-record bypass:
+ * an oversized record is omitted (its references stay whole) and counted in
+ * `omitted`, which is always `totalCount - included`. The omitted-count line is
+ * part of the measured section even when no detail record fits.
+ */
+export function fitDependencyHandoffs(records: DependencyHandoff[], totalCount: number): { dependencies: DependencyHandoff[]; omitted: number } {
+	const included: DependencyHandoff[] = [];
+	for (const record of records.slice(0, DEP_MAX_RECORDS)) {
+		const candidate = [...included, record];
+		const omitted = Math.max(0, totalCount - candidate.length);
+		if (Buffer.byteLength(renderDependencySection(candidate, omitted), "utf8") <= DEP_RENDER_BUDGET_BYTES) included.push(record);
+	}
+	return { dependencies: included, omitted: Math.max(0, totalCount - included.length) };
 }
 
 export interface CreateJobInput {
@@ -673,6 +715,19 @@ export class Orchestrator {
 				selectedArtifacts: lastResult.artifacts.map((a) => a.path).slice(0, 5),
 			};
 		}
+		// Dependency handoff is built from the CURRENT persisted prerequisite
+		// results (job.dependsOn), never the context captured at job creation, so
+		// a downstream job sees the real predecessor outcome. Jobs without
+		// dependencies keep their stored context untouched.
+		if (job.dependsOn.length > 0) {
+			const handoff = this.buildDependencyHandoffs(job);
+			packInput.dependencies = handoff.dependencies;
+			if (handoff.omitted > 0) packInput.dependenciesOmitted = handoff.omitted;
+			else delete packInput.dependenciesOmitted;
+		} else {
+			delete packInput.dependencies;
+			delete packInput.dependenciesOmitted;
+		}
 		const built = buildContextPack({
 			objective: job.objective,
 			context: packInput,
@@ -873,6 +928,83 @@ export class Orchestrator {
 				.filter(Boolean)
 				.join("\n"),
 		};
+	}
+
+	/**
+	 * Build bounded, evidence-only handoffs from the CURRENT persisted state of
+	 * the job's prerequisites. Reads fresh via readJob/readResult (never the
+	 * context captured at job creation) so a downstream job always sees the
+	 * actual predecessor outcome. A missing result is a clear "missing" status,
+	 * never a crash.
+	 */
+	private buildDependencyHandoffs(job: JobRecord): { dependencies: DependencyHandoff[]; omitted: number } {
+		const seen = new Set<string>();
+		const depIds: string[] = [];
+		for (const id of job.dependsOn) {
+			if (typeof id !== "string" || !id.trim() || seen.has(id)) continue;
+			seen.add(id);
+			depIds.push(id);
+		}
+		const records = depIds.slice(0, DEP_MAX_RECORDS).map((depId) => this.buildDependencyHandoff(depId));
+		return fitDependencyHandoffs(records, depIds.length);
+	}
+
+	/** Build one bounded (but not yet budget-fitted) handoff record. Absolute
+	 * result/artifact references are kept whole; the record is omitted by
+	 * fitDependencyHandoffs when its full rendered form would exceed the budget. */
+	private buildDependencyHandoff(depId: string): DependencyHandoff {
+		const store = this.store;
+		const depJob = this.readJob(depId);
+		const result = this.readResult(depId);
+		const attemptId = result?.attemptId;
+		const findings = result?.findings ?? [];
+		const changed = result?.changes ?? [];
+		const rawArtifacts = result?.artifacts ?? [];
+		const resolvedArtifacts = rawArtifacts
+			.slice(0, DEP_MAX_ARTIFACTS)
+			.map((a) => this.resolveDependencyArtifact(depId, attemptId, a.path))
+			.filter((p): p is string => Boolean(p));
+		const record: DependencyHandoff = {
+			jobId: depId,
+			agent: depJob?.agent ?? "unknown",
+			status: !result ? "missing" : (depJob?.status ?? "missing"),
+			summary: result ? boundText(result.summary, DEP_SUMMARY_CHARS) : "No result.json was stored for this prerequisite.",
+			findings: findings.slice(0, DEP_MAX_FINDINGS).map((f) => {
+				const message = boundText(f.message, DEP_FINDING_MESSAGE_CHARS);
+				const evidence = boundText(f.evidence, DEP_FINDING_EVIDENCE_CHARS);
+				return evidence ? { message, evidence } : { message };
+			}),
+			changedPaths: changed.slice(0, DEP_MAX_CHANGED_PATHS).map((p) => boundText(p, DEP_CHANGED_PATH_CHARS)),
+			validation: result?.validation?.status ?? "skipped",
+			artifacts: resolvedArtifacts,
+			resultPath: path.resolve(store.jobDir(depId), "result.json"),
+		};
+		const findingsOmitted = findings.length - DEP_MAX_FINDINGS;
+		if (findingsOmitted > 0) record.findingsOmitted = findingsOmitted;
+		const changedPathsOmitted = changed.length - DEP_MAX_CHANGED_PATHS;
+		if (changedPathsOmitted > 0) record.changedPathsOmitted = changedPathsOmitted;
+		const artifactsOmitted = rawArtifacts.length - DEP_MAX_ARTIFACTS;
+		if (artifactsOmitted > 0) record.artifactsOmitted = artifactsOmitted;
+		return record;
+	}
+
+	/** Resolve a worker-declared artifact path to an absolute, existing file via
+	 * the storage resolver (job-level first, then attempt-level). Never invents a
+	 * path: unresolvable references are dropped. */
+	private resolveDependencyArtifact(depId: string, attemptId: string | undefined, relPath: string): string | null {
+		if (!relPath) return null;
+		const store = this.store;
+		const jobLevel = store.resolveArtifact(store.jobArtifactsDir(depId), relPath);
+		if (jobLevel) return jobLevel;
+		if (attemptId) {
+			const attemptLevel = store.resolveArtifact(store.attemptArtifactsDir(depId, attemptId), relPath);
+			if (attemptLevel) return attemptLevel;
+		}
+		for (const a of store.listAttempts(depId).reverse()) {
+			const found = store.resolveArtifact(store.attemptArtifactsDir(depId, a.attemptId), relPath);
+			if (found) return found;
+		}
+		return null;
 	}
 
 	private failJob(job: JobRecord, reason: string): void {

@@ -13,7 +13,12 @@ import * as path from "node:path";
 import type { WorkspaceInfo } from "./types.ts";
 
 function git(args: string[], cwd: string): string {
-	return execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
+	// Explicitly pipe stdin/stdout/stderr. Without an explicit stdio config
+	// execFileSync inherits stderr, so expected-to-fail probes (e.g. rev-parse
+	// --verify on a fresh branch, rev-parse --git-dir in a non-repo) leak
+	// "fatal: ..." lines onto the Pi terminal while still throwing with a
+	// populated error.stderr for callers.
+	return execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 export function isGitRepo(cwd: string): boolean {

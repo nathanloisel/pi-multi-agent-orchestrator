@@ -567,8 +567,10 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Delegate jobs to sub agents (single or DAG batch); workers return validated structured results",
 		promptGuidelines: [
 			"Use delegate for ALL work requiring file access, commands, search, images, or code changes — the orchestrator has no direct tools.",
-			"Write delegate tasks for a focused cheap model with zero conversation context: exact paths, symbols, constraints, acceptance criteria.",
-			"Batch independent work into one delegate call with multiple jobs; express ordering with dependsOn instead of chain calls.",
+			"You own synthesis, diagnosis, and design; use delegate for bounded work — workers collect facts or implement decided changes, not open-ended architecture.",
+			"Write delegate tasks for a focused cheap model with zero conversation context: objective, exact targets, chosen approach/steps, boundaries/non-goals, expected cases, and the validation command.",
+			"Use delegate with the fewest coherent jobs: keep related changes and their specified tests together, batch only independent jobs with dependsOn, and never create one job per file or command.",
+			"Use delegate followup for related bounded corrections; let the automatic retry ladder handle execution errors and replan a bad specification instead of retrying it.",
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String()),

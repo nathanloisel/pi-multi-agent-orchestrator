@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { OrchestratorError } from "../core/errors.ts";
 import type { SpawnRequest } from "../core/spawn.ts";
-import type { JobResult, UsageInfo } from "../core/types.ts";
+import type { ContextPack, JobResult, UsageInfo } from "../core/types.ts";
 import { emptyValidation } from "../core/types.ts";
 import { BudgetManager } from "../core/budget.ts";
 import { makeAgent, makeHarness, outcome, writingWorker } from "./helpers.ts";
@@ -30,6 +30,14 @@ const successResult = (summary = "did it") => ({
 	followUps: [],
 	metrics: {},
 });
+
+/** Slice the ACTUAL rendered dependency section out of a worker envelope. */
+function dependencySection(prompt: string): string {
+	const start = prompt.indexOf("# DEPENDENCY HANDOFFS");
+	if (start < 0) return "";
+	const end = prompt.indexOf("\n# ", start + 1);
+	return prompt.slice(start, end === -1 ? undefined : end);
+}
 
 describe("Orchestrator jobs & attempts", () => {
 	it("create → run → success with canonical result.json at job and attempt level", async () => {
@@ -491,6 +499,176 @@ describe("DAG scheduling (§11)", () => {
 		const g = h.orch.graph();
 		assert.equal(g.nodes.find((n) => n.jobId === "job-c")!.status, "failed");
 		assert.equal(h.workerCalls.length, 1, "blocked job must never spawn a worker");
+		h.cleanup();
+	});
+
+	it("injects prerequisite evidence and usable references into a dependent job envelope", async () => {
+		const h = makeHarness();
+		h.setWorker(
+			writingWorker((attemptDir, jobId) => {
+				if (jobId === "pred") {
+					const artifact = path.join(attemptDir, "artifacts", "note.txt");
+					fs.mkdirSync(path.dirname(artifact), { recursive: true });
+					fs.writeFileSync(artifact, "artifact body");
+					return outcome({
+						status: "success",
+						summary: "parser added",
+						findings: [{ severity: "info", code: "PATTERN", message: "existing pattern", evidence: "core/x.ts:12" }],
+						changes: ["core/x.ts"],
+						validation: { status: "passed", checks: [] },
+						artifacts: [{ id: "note", type: "file", path: "note.txt", size: 13 }],
+						blockers: [],
+						followUps: [],
+						metrics: {},
+					});
+				}
+				return outcome(successResult("dependent done"));
+			}),
+		);
+		const a = h.orch.createJob({ agent: "worker", task: "pred", jobId: "pred" }, h.agents);
+		const b = h.orch.createJob({ agent: "worker", task: "dep", jobId: "dep", dependsOn: ["pred"] }, h.agents);
+		const reports = await h.orch.runGraph(h.agents, { jobIds: [a.jobId, b.jobId] });
+		assert.equal(reports.length, 2);
+		const depCall = h.workerCalls.find((c) => c.jobId === "dep")!;
+		const depPrompt = depCall.prompt;
+		assert.match(depPrompt, /# DEPENDENCY HANDOFFS/);
+		assert.ok(depPrompt.includes("parser added"));
+		assert.ok(depPrompt.includes("existing pattern"));
+		assert.ok(depPrompt.includes("core/x.ts:12"));
+		assert.ok(depPrompt.includes("core/x.ts"));
+		assert.ok(depPrompt.includes("note.txt"));
+		const resultPath = path.join(h.orch.store.jobDir("pred"), "result.json");
+		assert.ok(depPrompt.includes(resultPath), "dependency section must carry the canonical result.json pointer");
+		assert.ok(fs.existsSync(resultPath));
+		h.cleanup();
+	});
+
+	it("bounds dependency handoff detail and labels omitted prerequisite records", async () => {
+		const h = makeHarness();
+		const longSummary = "S".repeat(1000);
+		h.setWorker(
+			writingWorker((_dir, jobId) =>
+				jobId === "dep"
+					? outcome(successResult("dep done"))
+					: outcome({
+							status: "success",
+							summary: longSummary,
+							findings: Array.from({ length: 5 }, (_, i) => ({ severity: "info" as const, code: `F${i}`, message: `M${i}${"m".repeat(500)}`, evidence: `E${i}${"e".repeat(500)}` })),
+							changes: Array.from({ length: 7 }, (_, i) => `/p/file-${i}-${"x".repeat(300)}.ts`),
+							validation: { status: "passed", checks: [] },
+							artifacts: [],
+							blockers: [],
+							followUps: [],
+							metrics: {},
+						}),
+			),
+		);
+		const preds: string[] = [];
+		for (let i = 0; i < 10; i++) {
+			const id = `p${i}`;
+			h.orch.createJob({ agent: "worker", task: id, jobId: id }, h.agents);
+			preds.push(id);
+		}
+		h.orch.createJob({ agent: "worker", task: "dep", jobId: "dep", dependsOn: preds }, h.agents);
+		await h.orch.runGraph(h.agents);
+		const depCall = h.workerCalls.find((c) => c.jobId === "dep")!;
+		const stored = JSON.parse(fs.readFileSync(path.join(depCall.attemptDir, "context.json"), "utf-8")) as ContextPack;
+		assert.ok(stored.dependencies && stored.dependencies.length >= 1);
+		assert.ok(stored.dependencies!.length <= 8, "at most 8 prerequisite detail records");
+		assert.ok((stored.dependenciesOmitted ?? 0) >= 2, "records beyond the bound are counted as omitted");
+		const first = stored.dependencies![0];
+		assert.ok(first.summary.length <= 400);
+		assert.ok(first.findings.length <= 3);
+		assert.ok(first.findings.every((f) => f.message.length <= 300 && (f.evidence?.length ?? 0) <= 300));
+		assert.ok(first.changedPaths.length <= 5);
+		assert.ok(first.changedPaths.every((p) => p.length <= 200));
+		assert.ok(first.artifacts.length <= 3);
+		assert.ok(fs.existsSync(first.resultPath));
+		assert.equal(first.findingsOmitted, 2, "5 findings with a cap of 3 must report 2 omitted");
+		assert.equal(first.changedPathsOmitted, 2, "7 changed paths with a cap of 5 must report 2 omitted");
+		assert.match(depCall.prompt, /prerequisite record\(s\) omitted/);
+		assert.match(depCall.prompt, /2 additional finding\(s\) omitted by handoff bounds/);
+		assert.match(depCall.prompt, /2 additional changed path\(s\) omitted by handoff bounds/);
+		assert.ok(Buffer.byteLength(dependencySection(depCall.prompt), "utf8") <= 24 * 1024, "actual rendered section must respect the UTF-8 budget");
+		h.cleanup();
+	});
+
+	it("enforces the UTF-8 dependency budget for Unicode-heavy results and omits whole records", async () => {
+		const h = makeHarness();
+		const heavy = (n: number) => "€".repeat(n);
+		// A deeply nested artifact proves long absolute references stay whole.
+		const longRel = Array.from({ length: 5 }, (_, i) => `segment-${i}-${"q".repeat(140)}`).join("/") + "/evidence.txt";
+		h.setWorker(
+			writingWorker((attemptDir, jobId) => {
+				if (jobId === "dep") return outcome(successResult("dep done"));
+				const artifact = path.join(attemptDir, "artifacts", longRel);
+				fs.mkdirSync(path.dirname(artifact), { recursive: true });
+				fs.writeFileSync(artifact, "evidence");
+				return outcome({
+					status: "success",
+					summary: heavy(1000),
+					findings: Array.from({ length: 5 }, (_, i) => ({ severity: "info" as const, code: `F${i}`, message: heavy(400), evidence: heavy(400) })),
+					changes: Array.from({ length: 7 }, (_, i) => `/${i}/${heavy(300)}.ts`),
+					validation: { status: "passed", checks: [] },
+					artifacts: [{ id: "long", type: "file", path: longRel, size: 8 }],
+					blockers: [],
+					followUps: [],
+					metrics: {},
+				});
+			}),
+		);
+		const preds: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			const id = `u${i}`;
+			h.orch.createJob({ agent: "worker", task: id, jobId: id }, h.agents);
+			preds.push(id);
+		}
+		h.orch.createJob({ agent: "worker", task: "dep", jobId: "dep", dependsOn: preds }, h.agents);
+		await h.orch.runGraph(h.agents);
+		const depCall = h.workerCalls.find((c) => c.jobId === "dep")!;
+		const stored = JSON.parse(fs.readFileSync(path.join(depCall.attemptDir, "context.json"), "utf-8")) as ContextPack;
+		// The 24 KiB budget (not the 8-record cap) must drop at least one record.
+		assert.ok(stored.dependencies!.length >= 1 && stored.dependencies!.length < 3, `expected budget truncation, got ${stored.dependencies!.length}`);
+		assert.equal((stored.dependenciesOmitted ?? 0) + stored.dependencies!.length, 3, "every unrepresented prerequisite must be counted");
+		for (const dep of stored.dependencies!) {
+			assert.ok(dep.resultPath.length > 0 && !dep.resultPath.includes("…"), "result references must stay whole");
+			for (const artifact of dep.artifacts) {
+				assert.ok(!artifact.includes("…") && fs.existsSync(artifact), "artifact references must stay whole and usable");
+			}
+		}
+		const section = dependencySection(depCall.prompt);
+		assert.ok(Buffer.byteLength(section, "utf8") <= 24 * 1024, `actual rendered section was ${Buffer.byteLength(section, "utf8")} bytes`);
+		assert.match(section, /prerequisite record\(s\) omitted by handoff bounds/);
+		h.cleanup();
+	});
+
+	it("reports a missing prerequisite result instead of crashing a direct dependent run", async () => {
+		const h = makeHarness();
+		h.setWorker(writingWorker(() => outcome(successResult("dep done"))));
+		h.orch.createJob({ agent: "worker", task: "pred", jobId: "pred" }, h.agents);
+		const predJob = h.orch.store.readJob("pred")!;
+		predJob.status = "success";
+		h.orch.store.writeJob(predJob); // no result.json was ever produced
+		const dep = h.orch.createJob({ agent: "worker", task: "dep", jobId: "dep", dependsOn: ["pred"] }, h.agents);
+		const report = await h.orch.runJob(dep, h.agents);
+		assert.equal(report.status, "success");
+		const depCall = h.workerCalls.find((c) => c.jobId === "dep")!;
+		assert.match(depCall.prompt, /# DEPENDENCY HANDOFFS/);
+		assert.match(depCall.prompt, /missing/);
+		assert.match(depCall.prompt, /No result\.json was stored for this prerequisite/);
+		h.cleanup();
+	});
+
+	it("leaves envelopes unchanged for jobs without dependencies", async () => {
+		const h = makeHarness();
+		h.setWorker(writingWorker(() => outcome(successResult())));
+		const job = h.orch.createJob({ agent: "worker", task: "standalone", context: { background: "legacy background", relevantFiles: ["legacy.ts"] } }, h.agents);
+		const report = await h.orch.runJob(job, h.agents);
+		assert.equal(report.status, "success");
+		const promptText = h.workerCalls[0].prompt;
+		assert.ok(promptText.includes("legacy background"));
+		assert.ok(promptText.includes("legacy.ts"));
+		assert.doesNotMatch(promptText, /# DEPENDENCY HANDOFFS/);
 		h.cleanup();
 	});
 

@@ -55,6 +55,72 @@ export interface SpawnOutcome {
 	runError?: OrchestratorError;
 }
 
+/** Hard bound for each captured stream file (current and previous). */
+export const MAX_STREAM_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Bounded capture of raw pi `--mode json` event lines into
+ * attemptDir/stream.jsonl, with one rotated predecessor stream.previous.jsonl.
+ *
+ * Wire contract: both files are plain JSONL containing raw complete valid event
+ * lines. Before appending a line that would push the current file past
+ * maxBytes, the current file is renamed to stream.previous.jsonl (overwritten),
+ * so exactly current + previous exist and chronology is previous → current.
+ * Whole lines larger than maxBytes are dropped so the files never contain a
+ * truncated JSON object; normal stdout processing is unaffected.
+ *
+ * Every operation is best-effort: persistence errors are swallowed so worker
+ * execution and result extraction are never blocked or failed. Files are
+ * created 0600 because events may contain sensitive session text, and capture
+ * never prints to stdout.
+ */
+export class StreamCapture {
+	private currentBytes = 0;
+	private readonly currentPath: string;
+	private readonly previousPath: string;
+
+	constructor(
+		attemptDir: string,
+		private readonly maxBytes: number = MAX_STREAM_BYTES,
+	) {
+		this.currentPath = path.join(attemptDir, "stream.jsonl");
+		this.previousPath = path.join(attemptDir, "stream.previous.jsonl");
+		try {
+			fs.mkdirSync(attemptDir, { recursive: true });
+			const st = fs.statSync(this.currentPath);
+			this.currentBytes = st.isFile() ? st.size : 0;
+		} catch {
+			this.currentBytes = 0;
+		}
+	}
+
+	/** Append one raw, already-validated JSON event line. Never throws. */
+	append(line: string): void {
+		try {
+			const bytes = Buffer.byteLength(line, "utf-8") + 1; // + newline
+			if (bytes > this.maxBytes) return; // oversized single line: skip, keep valid JSONL
+			if (this.currentBytes > 0 && this.currentBytes + bytes > this.maxBytes) this.rotate();
+			fs.appendFileSync(this.currentPath, `${line}\n`, { mode: 0o600 });
+			this.currentBytes += bytes;
+		} catch {
+			/* capture is optional and must never affect the worker outcome */
+		}
+	}
+
+	private rotate(): void {
+		try {
+			fs.renameSync(this.currentPath, this.previousPath);
+		} catch {
+			try {
+				fs.rmSync(this.currentPath, { force: true });
+			} catch {
+				/* ignore */
+			}
+		}
+		this.currentBytes = 0;
+	}
+}
+
 export function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -148,6 +214,8 @@ export async function runWorker(req: SpawnRequest): Promise<SpawnOutcome> {
 	let sessionId: string | undefined;
 	let aborted = false;
 
+	const capture = new StreamCapture(req.attemptDir);
+
 	const exitCode = await new Promise<number>((resolve) => {
 		const invocation = getPiInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, { cwd: req.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });
@@ -162,6 +230,7 @@ export async function runWorker(req: SpawnRequest): Promise<SpawnOutcome> {
 				return;
 			}
 			if (!parsed || typeof parsed !== "object") return;
+			capture.append(line); // raw valid event line; best-effort bounded capture
 			const event = parsed as { type?: unknown; sessionId?: unknown; message?: unknown };
 			if (event.type === "session_start" && typeof event.sessionId === "string") sessionId = event.sessionId;
 			if (event.type === "message_end" && event.message && typeof event.message === "object") {

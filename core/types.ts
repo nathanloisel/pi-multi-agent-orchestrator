@@ -284,6 +284,30 @@ export interface AgentConfig {
 
 // ── Context packs (§19) ────────────────────────────────────────────────────
 
+/**
+ * Bounded evidence carried automatically from a prerequisite job into a
+ * dependent job's context (one entry per `dependsOn` id). Deliberately NOT a
+ * transcript or a source dump: small capped fields plus an absolute canonical
+ * result.json reference so a worker can read full detail on demand. Artifact
+ * references are resolved to absolute, existing paths via the storage helpers
+ * (never invented). */
+export interface DependencyHandoff {
+	jobId: string;
+	agent: string;
+	status: JobStatus | "missing"; // "missing" = no stored result for the prerequisite
+	summary: string;
+	findings: { message: string; evidence?: string }[];
+	changedPaths: string[];
+	validation: ValidationStatus;
+	artifacts: string[]; // absolute paths resolved from the prerequisite's artifacts
+	/** Absolute canonical result.json path for the prerequisite. */
+	resultPath: string;
+	/** Counts of list values dropped by the per-entry caps (optional for old contexts). */
+	findingsOmitted?: number;
+	changedPathsOmitted?: number;
+	artifactsOmitted?: number;
+}
+
 export interface ContextPack {
 	objective: string;
 	relevantFiles?: string[];
@@ -297,6 +321,10 @@ export interface ContextPack {
 		validation?: ValidationOutcome;
 		selectedArtifacts?: string[];
 	};
+	/** Bounded handoffs from prerequisite jobs — evidence, not instructions. */
+	dependencies?: DependencyHandoff[];
+	/** Count of prerequisite records dropped by the handoff bounds. */
+	dependenciesOmitted?: number;
 }
 
 // ── Routing (§9) ───────────────────────────────────────────────────────────

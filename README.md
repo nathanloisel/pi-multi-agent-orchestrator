@@ -66,7 +66,7 @@ FRONTIER MAIN AGENT (planner only; delegate/jobs tools; hard tool block)
 └── jobs/<jobId>/                       # job store
     ├── job.json · task.md · events.jsonl · result.json · report.md
     ├── artifacts/
-    └── attempts/attempt-NNN/           # per-attempt session/result/usage
+    └── attempts/attempt-NNN/           # session/result/usage + stream.jsonl capture
 ~/.pi/agents/<name>/AGENT.md            # worker runtime packages (v2)
 ```
 
@@ -212,6 +212,11 @@ session switch and cleared on `/reload` (see [Troubleshooting](#troubleshooting)
 - Single: `{ agent, task, context?, kind?, id?, model?, retry?, cwd? }`
 - Batch (DAG): `{ jobs: [{ id, dependsOn, agent, task, … }] }` — independent
   jobs run concurrently; failed dependencies gate downstream jobs.
+- Jobs that declare `dependsOn` automatically receive a bounded handoff from each
+  succeeded prerequisite (summary, capped findings, changed paths, artifact and
+  result.json references). It is evidence only — predecessor edits are not merged
+  and isolated worktrees may not contain them; read the referenced result.json or
+  use `jobs.followup` when more detail is needed.
 - The optional `model` is a logical alias override applied to the job's first
   attempt; `jobs.retry model=…` overrides later.
 
