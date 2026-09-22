@@ -1,6 +1,6 @@
 {
 	"name": "pi-multi-agent-orchestrator",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "Pi-native multi-agent orchestrator: delegate jobs to isolated sub-agent workers with model routing, DAG scheduling, retries, budgets, and validated structured results.",
 	"license": "MIT",
 	"author": "Nathan Loisel",
