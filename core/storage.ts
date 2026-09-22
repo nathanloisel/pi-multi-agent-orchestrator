@@ -69,6 +69,20 @@ export function sha256File(file: string): string | undefined {
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
+/**
+ * True when a process id refers to a live process (0-signal probe).
+ * EPERM means the process exists but is not ours (alive); ESRCH means dead.
+ */
+export function isProcessAlive(pid: number | undefined): boolean {
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 export class JobStore {
 	private recoveryHandler?: (job: JobRecord, attempt: AttemptRecord) => void;
 
@@ -138,7 +152,13 @@ export class JobStore {
 	/** Mark attempts left "running" by a crash as interrupted (§29). */
 	recoverInterrupted(job: JobRecord): JobRecord {
 		const attempt = job.latestAttemptId ? this.readAttempt(job.jobId, job.latestAttemptId) : null;
-		if (attempt && attempt.status === "running") {
+		// Crash recovery is for ORPHANED attempts only. While the owning
+		// orchestrator process is still alive (attempt.ownerPid), a "running"
+		// attempt is genuinely running — a live worker may be blocked on a
+		// pending ask — and reads (readJob/listJobs via jobs status/list/
+		// graph/wait) must NEVER flip it to "interrupted". Missing/dead
+		// owners recover exactly as before (legacy policy).
+		if (attempt && attempt.status === "running" && !isProcessAlive(attempt.ownerPid)) {
 			attempt.status = "interrupted";
 			attempt.exitReason = "crashed";
 			attempt.completedAt = Date.now();

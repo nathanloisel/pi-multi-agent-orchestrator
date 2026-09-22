@@ -275,6 +275,33 @@ describe("Orchestrator jobs & attempts", () => {
 		h2.cleanup();
 		h.cleanup();
 	});
+
+	it("crash recovery skips attempts owned by a LIVE process (background yields keep running)", async () => {
+		const h = makeHarness();
+		const job = h.orch.createJob({ agent: "worker", task: "live owner" }, h.agents);
+		const attemptId = h.orch["store"].allocateAttempt(job.jobId);
+		h.orch["store"].writeAttempt({
+			schemaVersion: 1,
+			attemptId,
+			jobId: job.jobId,
+			agent: "worker",
+			retryMode: "initial",
+			status: "running",
+			startedAt: Date.now(),
+			ownerPid: process.pid, // THIS process is alive
+		});
+		job.status = "running";
+		job.latestAttemptId = attemptId;
+		h.orch["store"].writeJob(job);
+
+		// every recovery-applying read keeps the live attempt running
+		assert.equal(h.orch.readJob(job.jobId)!.status, "running");
+		assert.equal(h.orch.readAttempt(job.jobId, attemptId)!.status, "running");
+		assert.equal(h.orch.listJobs().find((j) => j.jobId === job.jobId)!.status, "running");
+		// and the job stays schedulable/messageable rather than "interrupted"
+		assert.equal(h.orch.hasLiveWorker(job.jobId), false);
+		h.cleanup();
+	});
 });
 
 describe("canonical status precedence (terminal runError)", () => {

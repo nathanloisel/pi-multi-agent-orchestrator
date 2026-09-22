@@ -493,6 +493,46 @@ describe("ask-user UI helper", () => {
 		assert.equal(opened.length, 0, "ctx.ui.custom is never used in RPC mode");
 	});
 
+	it("RPC fallback reports timeout when the local deadline aborts the built-in dialog", async () => {
+		// built-in dialogs resolve undefined on abort; no default answer is chosen
+		const dialog = (opts: { signal?: AbortSignal } | undefined) =>
+			new Promise<string | undefined>((resolve) => {
+				if (opts?.signal?.aborted) return resolve(undefined);
+				opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+			});
+		const ctx = {
+			mode: "rpc",
+			hasUI: true,
+			ui: {
+				select: async (_t: string, _l: string[], opts: { signal?: AbortSignal }) => dialog(opts),
+				input: async (_t: string, _p: string, opts: { signal?: AbortSignal }) => dialog(opts),
+				notify: () => {},
+				custom: async () => null,
+			},
+		} as unknown as ExtensionContext;
+		const result = await askUserQuestion(ctx, { question: "Slow?", options: [{ label: "A" }, { label: "B" }], timeoutSeconds: 1 });
+		assert.deepEqual(result, { status: "timeout" }, "deadline-abort must map to timeout, not cancelled");
+		const textOnly = await askUserQuestion(ctx, { question: "Free text?", timeoutSeconds: 1 });
+		assert.deepEqual(textOnly, { status: "timeout" });
+	});
+
+	it("RPC fallback reports cancelled on explicit dismissal (Escape), never a default answer", async () => {
+		const ctx = {
+			mode: "rpc",
+			hasUI: true,
+			ui: {
+				select: async () => undefined, // user dismisses the option list
+				input: async () => undefined, // user dismisses the custom dialog
+				notify: () => {},
+				custom: async () => null,
+			},
+		} as unknown as ExtensionContext;
+		const picked = await askUserQuestion(ctx, { question: "Pick?", options: [{ label: "A" }, { label: "B" }], allowCustom: false, timeoutSeconds: 5 });
+		assert.deepEqual(picked, { status: "cancelled" }, "explicit dismissal must map to cancelled");
+		const textOnly = await askUserQuestion(ctx, { question: "Free text?", timeoutSeconds: 5 });
+		assert.deepEqual(textOnly, { status: "cancelled" });
+	});
+
 	it("serializes simultaneous questions FIFO with answers isolated to the exact request", async () => {
 		const { ctx, opened } = makeTuiCtx();
 		const q1 = askUserQuestion(ctx, { question: "First?", options: [{ label: "One" }, { label: "Two" }] });
@@ -597,7 +637,8 @@ fs.writeFileSync(
 		"let counter = 0;",
 		"try { counter = parseInt(fs.readFileSync(path.join(cfg, 'fake-rpc-count'), 'utf8'), 10) || 0; } catch {}",
 		"try { fs.writeFileSync(path.join(cfg, 'fake-rpc-count'), String(counter + 1)); } catch {}",
-		"const behavior = spec.behaviors[Math.min(counter, spec.behaviors.length - 1)];",
+		"const byId = (spec.jobs ?? {})[process.env.PI_ORCHESTRATOR_JOB_ID ?? \'\'];",
+		"const behavior = byId ?? spec.behaviors[Math.min(counter, spec.behaviors.length - 1)];",
 		"if (process.env.PI_ORCHESTRATOR_RESULT_PATH) {",
 		"  fs.writeFileSync(process.env.PI_ORCHESTRATOR_RESULT_PATH, JSON.stringify({",
 		"    schemaVersion: 1,",
@@ -665,9 +706,9 @@ interface FakeBehavior {
 	eventsAfterUiResponse?: unknown[];
 }
 
-function writeSpec(behaviors: FakeBehavior[]): void {
+function writeSpec(behaviors: FakeBehavior[], jobs: Record<string, FakeBehavior> = {}): void {
 
-	fs.writeFileSync(path.join(configDir, "fake-rpc-spec.json"), JSON.stringify({ behaviors }));
+	fs.writeFileSync(path.join(configDir, "fake-rpc-spec.json"), JSON.stringify({ behaviors, jobs }));
 	fs.rmSync(path.join(configDir, "fake-rpc-count"), { force: true });
 	fs.writeFileSync(path.join(configDir, "fake-rpc-child.log"), "");
 }
@@ -753,9 +794,22 @@ function makeExtCtx(overrides: { mode?: string; hasUI?: boolean } = {}) {
 	return { ctx, opened };
 }
 
-function readStoredJob(jobId: string): { status: string; startedAt?: number } | null {
+function readStoredJob(jobId: string): { status: string; startedAt?: number; completedAt?: number } | null {
 	try {
 		return JSON.parse(fs.readFileSync(path.join(orchRoot, "jobs", jobId, "job.json"), "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+/** Raw attempt.json read: the live-worker regression asserts the attempt was never flipped to interrupted. */
+function readStoredAttempt(jobId: string): { status: string; ownerPid?: number } | null {
+	try {
+		const attemptsDir = path.join(orchRoot, "jobs", jobId, "attempts");
+		for (const name of fs.readdirSync(attemptsDir)) {
+			return JSON.parse(fs.readFileSync(path.join(attemptsDir, name, "attempt.json"), "utf8"));
+		}
+		return null;
 	} catch {
 		return null;
 	}
@@ -893,6 +947,105 @@ describe("extension: live messaging end to end", () => {
 		assert.ok(b.startedAt && (a.completedAt ?? 0) <= b.startedAt, "dependent must start after the prerequisite completes");
 		// both spawns happened (sequential counter)
 		assert.equal(fs.readFileSync(path.join(configDir, "fake-rpc-count"), "utf8"), "2");
+	});
+
+	it("jobs status/list/graph/wait keep a live worker's job running (no false interrupted)", async () => {
+		writeSpec([
+			{
+				ask: encodeRequestEnvelope({ kind: "ask_main", question: "Blocked while you inspect?", timeoutSeconds: 30 }),
+				askId: "ui-inspect",
+				settleOnUiResponse: true,
+			},
+		]);
+		const mock = makeMockPi(false);
+		extension(mock.pi);
+		const { ctx } = makeExtCtx();
+		await mock.handlers.get("session_start")!({}, ctx);
+		const delegate = mock.tools.get("delegate")!;
+		const yielded = (await delegate.execute("c1", { agent: "worker", task: "inspectable" }, undefined, undefined, ctx)) as {
+			content: { type: string; text: string }[];
+			details: { jobIds?: string[] };
+		};
+		const jobId = yielded.details.jobIds![0]!;
+		assert.equal(readStoredJob(jobId)?.status, "running");
+
+		// Every inspection path applies crash recovery on read — with a LIVE
+		// owner the attempt must stay "running" (previously these flipped it).
+		const status = await toolText(mock, "jobs", { action: "status", jobId }, ctx);
+		assert.match(status.text, /status: running/);
+		const list = await toolText(mock, "jobs", { action: "list" }, ctx);
+		assert.match(list.text, /running/);
+		const graph = await toolText(mock, "jobs", { action: "graph" }, ctx);
+		assert.match(graph.text, /running/);
+		// raw attempt record never flipped to interrupted
+		const attempt = readStoredAttempt(jobId);
+		assert.equal(attempt?.status, "running", "a live owner's attempt must not be marked interrupted");
+		assert.equal(attempt?.ownerPid, process.pid, "ownerPid is persisted for liveness checks");
+
+		// jobs.wait polls the store while the child is alive; run it concurrently
+		// with the reply so the poll window overlaps the pending ask.
+		const waitPromise = toolText(mock, "jobs", { action: "wait", jobId }, ctx);
+		const msg = await toolText(mock, "jobs", { action: "message", jobId, message: "keep going after your answer" }, ctx);
+		assert.match(msg.text, /delivered: message sent to the live worker/, "the live child must still be steerable after inspection reads");
+		assert.equal(readStoredAttempt(jobId)?.status, "running");
+
+		const reply = await toolText(mock, "jobs", { action: "reply", jobId, requestId: "ui-inspect", answer: "go with plan B" }, ctx);
+		assert.match(reply.text, /delivered: answered request/);
+		const waitResult = await waitPromise;
+		assert.match(waitResult.text, /success/);
+		await waitFor(() => readStoredJob(jobId)?.status === "success");
+	});
+
+	it("concurrent A/B/C: A finishes while B asks; B is never interrupted; C starts only after B's real completion", async () => {
+		writeSpec(
+			[{ settleAfterMs: 150 }],
+			{
+				"conc-a": { settleAfterMs: 150 },
+				"conc-b": {
+					ask: encodeRequestEnvelope({ kind: "ask_main", question: "Which port?", timeoutSeconds: 30 }),
+					askId: "ui-port-b",
+					settleOnUiResponse: true,
+				},
+				"conc-c": { settleAfterMs: 150 },
+			},
+		);
+		const mock = makeMockPi(false);
+		extension(mock.pi);
+		const { ctx } = makeExtCtx();
+		await mock.handlers.get("session_start")!({}, ctx);
+		const delegate = mock.tools.get("delegate")!;
+		const yielded = (await delegate.execute(
+			"c1",
+			{
+				jobs: [
+					{ agent: "worker", task: "independent quick job", id: "conc-a" },
+					{ agent: "worker", task: "asks a blocking question", id: "conc-b" },
+					{ agent: "worker", task: "depends on the answer", id: "conc-c", dependsOn: ["conc-b"] },
+				],
+			},
+			undefined,
+			undefined,
+			ctx,
+		)) as { content: { type: string; text: string }[]; details: { jobIds?: string[] } };
+		assert.match(yielded.content[0]!.text, /delegate batch yielded/);
+
+		// A finishes while B is still blocked on its ask
+		await waitFor(() => readStoredJob("conc-a")?.status === "success");
+		assert.equal(readStoredJob("conc-b")?.status, "running");
+		assert.equal(readStoredAttempt("conc-b")?.status, "running", "B must never be flipped to interrupted while its owner is alive");
+		// a graph poll while B is blocked must not corrupt B either
+		const graph = await toolText(mock, "jobs", { action: "graph" }, ctx);
+		assert.match(graph.text, /conc-b/);
+		assert.equal(readStoredAttempt("conc-b")?.status, "running");
+
+		const reply = await toolText(mock, "jobs", { action: "reply", jobId: "conc-b", requestId: "ui-port-b", answer: "8080" }, ctx);
+		assert.match(reply.text, /delivered: answered request/);
+		await waitFor(() => readStoredJob("conc-b")?.status === "success");
+		await waitFor(() => readStoredJob("conc-c")?.status === "success");
+		// C started only after B's real completion
+		const b = readStoredJob("conc-b") as { completedAt?: number };
+		const c = readStoredJob("conc-c") as { startedAt?: number };
+		assert.ok(c.startedAt && b.completedAt && c.startedAt >= b.completedAt, "C must start after B actually completes");
 	});
 
 	it("jobs cancel aborts a live background worker without leaked processes", async () => {

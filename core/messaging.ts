@@ -100,6 +100,7 @@ function byteLength(s: string): number {
 /** Validate a non-empty bounded string field. Throws on violation. */
 function boundedString(value: unknown, maxBytes: number, field: string): string {
 	if (typeof value !== "string" || value.length === 0) throw new Error(`${field} must be a non-empty string`);
+	if (!value.trim()) throw new Error(`${field} must not be blank (whitespace-only text is rejected)`);
 	if (byteLength(value) > maxBytes) throw new Error(`${field} exceeds ${maxBytes} bytes`);
 	return value;
 }

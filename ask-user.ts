@@ -118,7 +118,11 @@ export async function askUserQuestion(ctx: ExtensionContext, params: QuestionUiP
 		if (ctx.mode === "rpc") {
 			// Built-in dialogs over the RPC extension-UI protocol.
 			if (controller.signal.aborted) return timedOut ? { status: "timeout" } : { status: "cancelled" };
-			return await askViaBuiltins(ctx, params, options, controller.signal);
+			const builtins = await askViaBuiltins(ctx, params, options, controller.signal);
+			// null = the dialog was dismissed with no answer: distinguish the local
+			// deadline (timeout) from an explicit Escape/external abort (cancelled).
+			if (builtins !== null) return builtins;
+			return timedOut ? { status: "timeout" } : { status: "cancelled" };
 		}
 		// TUI: serialize through the FIFO queue, but observe the deadline/abort
 		// the WHOLE time — including while queued. A question that expires while
@@ -160,12 +164,14 @@ export async function askUserQuestion(ctx: ExtensionContext, params: QuestionUiP
 
 // ── RPC fallback (built-in dialogs) ──────────────────────────────────────────
 
-async function askViaBuiltins(ctx: ExtensionContext, params: QuestionUiParams, options: QuestionUiOptions, signal: AbortSignal): Promise<QuestionOutcome> {
+/** Built-in RPC fallback. Returns null when a dialog was dismissed with no
+ * answer (timeout-vs-cancel mapping happens in the caller). */
+async function askViaBuiltins(ctx: ExtensionContext, params: QuestionUiParams, options: QuestionUiOptions, signal: AbortSignal): Promise<QuestionOutcome | null> {
 	const title = renderTitle(params, options);
 	const allowCustom = params.allowCustom ?? true;
 	if (params.options === undefined) {
 		const answer = await ctx.ui.input(title, "Your answer", { signal });
-		return answer === undefined ? { status: "cancelled" } : { status: "answered", answer, wasCustom: true };
+		return answer === undefined ? null : { status: "answered", answer, wasCustom: true };
 	}
 	const labels = params.options.map((o) => o.label);
 	const picked = await ctx.ui.select(title, labels, { signal });
@@ -174,7 +180,7 @@ async function askViaBuiltins(ctx: ExtensionContext, params: QuestionUiParams, o
 		const custom = await ctx.ui.input(`${title} (custom answer)`, "Your answer", { signal });
 		if (custom !== undefined) return { status: "answered", answer: custom, wasCustom: true };
 	}
-	return { status: "cancelled" };
+	return null;
 }
 
 function renderTitle(params: QuestionUiParams, options: QuestionUiOptions): string {

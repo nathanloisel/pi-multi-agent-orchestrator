@@ -873,6 +873,58 @@ describe("runWorker RPC transport", () => {
 		await assert.rejects(control!.steer("too late"), /stdin is closed|exited/);
 	});
 
+	it("drops whitespace-only message_main envelopes and never surfaces them as messages", async () => {
+		// The wire boundary rejects blank text: an envelope that slipped through
+		// with whitespace-only text decodes to nothing (never a message, never a crash).
+		const received: unknown[] = [];
+		const { req } = makeTransportReq(
+			{
+				promptResponse: "success",
+				eventsAfterPrompt: [
+					{ type: "extension_ui_request", id: "blank-1", method: "notify", message: `${MESSAGING_PREFIX}${JSON.stringify({ v: 1, kind: "message", text: "   \t " })}` },
+					{ type: "extension_ui_request", id: "blank-2", method: "notify", message: `${MESSAGING_PREFIX}${JSON.stringify({ v: 1, kind: "message", text: "" })}` },
+					assistantEnd("final answer"),
+				],
+				settleAfterMs: 100,
+			},
+			{ onMessage: (m) => received.push(m) },
+		);
+
+		const outcome = await runWorker(req);
+		assert.equal(outcome.exitCode, 0);
+		assert.equal(outcome.finalText, "final answer");
+		assert.equal(received.length, 0, "blank messages must be dropped at the boundary");
+		// the encoder rejects blank text up front too
+		assert.throws(() => encodeMessageEnvelope("   \t "), /blank/);
+		assert.throws(() => encodeRequestEnvelope({ kind: "ask_main", question: " " }), /blank/);
+	});
+
+	it("a throwing onMessage callback never crashes the parent; the run still completes", async () => {
+		const received: unknown[] = [];
+		const { req } = makeTransportReq(
+			{
+				promptResponse: "success",
+				eventsAfterPrompt: [
+					{ type: "extension_ui_request", id: "good-1", method: "notify", message: encodeMessageEnvelope("legit message before the crasher") },
+					{ type: "extension_ui_request", id: "crash-1", method: "notify", message: encodeMessageEnvelope("this one explodes the callback") },
+					assistantEnd("final answer"),
+				],
+				settleAfterMs: 100,
+			},
+			{
+				onMessage: (m) => {
+					received.push(m);
+					if ((m as { text: string }).text.includes("explodes")) throw new Error("broker callback exploded");
+				},
+			},
+		);
+
+		const outcome = await runWorker(req);
+		assert.equal(outcome.exitCode, 0, "the parent transport must survive a throwing observer");
+		assert.equal(outcome.finalText, "final answer", "stdout parsing continues past the crasher");
+		assert.equal(received.length, 2, "both messages reached the callback");
+	});
+
 	it("preserves overall execution timeout termination", async () => {
 		const { req } = makeTransportReq({ promptResponse: "success", eventsAfterPrompt: [assistantEnd("working")], keepAlive: true });
 		const outcome = await runWorker({ ...req, timeoutSeconds: 1 });

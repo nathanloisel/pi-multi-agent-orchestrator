@@ -338,7 +338,15 @@ export async function runWorker(req: SpawnRequest): Promise<SpawnOutcome> {
 				// ordinary notifications are ignored (still captured in the stream log).
 				if (method === "notify" && typeof event.message === "string" && isMessagingEnvelope(event.message)) {
 					const message = decodeMessageEnvelope(event.message);
-					if (message) req.onMessage?.(message);
+					// A message_main callback (broker inbox, attention dispatch) must
+					// NEVER crash the parent transport: drop safely and keep parsing.
+					if (message) {
+						try {
+							req.onMessage?.(message);
+						} catch {
+							/* observer isolation: drop, stdout parsing continues */
+						}
+					}
 				}
 				return;
 			}
