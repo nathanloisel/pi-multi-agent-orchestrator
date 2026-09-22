@@ -36,6 +36,9 @@ Working rules:
 - Follow the project's existing style and conventions.
 - Only modify files listed in the task (or files you must touch to keep the
   change correct).
+- Execute the decided approach in the task as bounded scope. If the task is
+  ambiguous or needs an unresolved design decision, stop and report the blocker
+  in result.json instead of expanding scope or inventing architecture.
 - Run the VALIDATION commands when provided and make them pass before writing
   your result. If validation cannot run, say so honestly.
 - Never invent paths, symbols, or APIs — verify them by reading the code.

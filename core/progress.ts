@@ -10,11 +10,16 @@
  */
 
 import type { EventType } from "./events.ts";
-import type { JobRecord, JobStatus } from "./types.ts";
+import type { JobRecord, JobStatus, PlanJobBinding } from "./types.ts";
 
 /** Custom session-entry type used to persist which job ids the CURRENT main
  * session branch owns/references. Membership only — never a second copy of
- * job state (job.json stays the sole source of truth). */
+ * job state (job.json stays the sole source of truth).
+ *
+ * Entries carry `{ jobIds: string[] }` and MAY additionally carry
+ * `{ bindings?: PlanJobBinding[] }` associating a job with the plan step that
+ * planned it. `bindings` is additive: readers that only understand `jobIds`
+ * are unaffected (see PLAN-CONTRACT.md). */
 export const PROGRESS_MEMBERSHIP_ENTRY_TYPE = "orchestrator.progress-jobs";
 
 /** Pure: collect tracked job ids from branch session entries (first-seen
@@ -33,6 +38,33 @@ export function collectMembershipJobIds(entries: readonly unknown[]): string[] {
 		}
 	}
 	return ids;
+}
+
+/** Pure: collect stable job→plan-step bindings from branch membership entries
+ * (first-seen, deduped). These are the explicit alias bindings recorded when a
+ * plan step id matches the delegate job alias or a step lists `jobIds`; they
+ * let a consumer associate a job with its plan step even though the persisted
+ * job objective's derived label does NOT preserve the delegate alias. */
+export function collectMembershipBindings(entries: readonly unknown[]): PlanJobBinding[] {
+	const out: PlanJobBinding[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		const e = entry as { type?: string; customType?: string; data?: { bindings?: unknown } } | null;
+		if (!e || e.type !== "custom" || e.customType !== PROGRESS_MEMBERSHIP_ENTRY_TYPE) continue;
+		const raw = e.data?.bindings;
+		if (!Array.isArray(raw)) continue;
+		for (const candidate of raw) {
+			const b = candidate as { jobId?: unknown; stepId?: unknown } | null | undefined;
+			const jobId = typeof b?.jobId === "string" && b.jobId.length > 0 ? b.jobId : null;
+			const stepId = typeof b?.stepId === "string" && b.stepId.length > 0 ? b.stepId : null;
+			if (!jobId || !stepId) continue;
+			const key = `${jobId}\u0000${stepId}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			out.push({ jobId, stepId });
+		}
+	}
+	return out;
 }
 
 /** Map a runtime event type to the tool-visible progress state it confirms.

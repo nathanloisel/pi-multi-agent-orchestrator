@@ -17,6 +17,8 @@
  *       ├── report.md
  *       ├── SYSTEM.md     # rendered sub-agent instructions
  *       ├── env.json      # non-secret env actually passed (audit)
+ *       ├── stream.jsonl  # raw pi --mode json events, bounded capture
+ *       ├── stream.previous.jsonl # rotated predecessor capture (≤2 MiB each)
  *       ├── artifacts/    # attempt artifacts + manifest.json
  *       ├── validation/   # deterministic check logs
  *       └── session/      # persistent pi session dir (resume channel)

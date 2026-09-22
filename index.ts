@@ -30,13 +30,12 @@ import { ModelRegistry } from "./core/models.ts";
 import { Router, type RoutingRule } from "./core/routing.ts";
 import { JobStore, readJson } from "./core/storage.ts";
 import {
+	collectMembershipBindings,
 	collectMembershipJobIds,
 	ProgressTracker,
 	progressStatusText,
 	PROGRESS_MEMBERSHIP_ENTRY_TYPE,
-	renderProgress,
 	stateFromEventType,
-	type ProgressTask,
 } from "./core/progress.ts";
 import { EventLog } from "./core/events.ts";
 import { BudgetManager } from "./core/budget.ts";
@@ -44,7 +43,21 @@ import { ConcurrencyManager } from "./core/concurrency.ts";
 import { Orchestrator, type CreateJobInput, type RunReport } from "./core/orchestrator.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "./core/telemetry.ts";
 import { scaffoldOrchestratorFiles } from "./core/scaffold.ts";
-import { DEFAULT_CONCURRENCY, type ConcurrencyConfig, type ContextPack, type JobRecord } from "./core/types.ts";
+import {
+	buildPlanSnapshot,
+	DEFAULT_CONCURRENCY,
+	deriveAutoPlanSteps,
+	PLAN_ENTRY_TYPE,
+	PLAN_SCHEMA_VERSION,
+	PLAN_STEP_STATUSES,
+	readLatestPlan,
+	renderPlanSummary,
+	type ConcurrencyConfig,
+	type ContextPack,
+	type JobRecord,
+	type PlanJobBinding,
+	type PlanSnapshot,
+} from "./core/types.ts";
 
 const ORCHESTRATOR_TOOLS = new Set(["delegate", "jobs"]);
 const MAX_PARALLEL_TASKS = 16;
@@ -105,18 +118,88 @@ export default function (pi: ExtensionAPI) {
 	let unlistenProgress: (() => void) | null = null;
 	const membershipLogged = new Set<string>();
 
+	// ── Structured plan (persisted snapshots on the current branch) ──
+	// Derived ONLY from `orchestrator.plan` entries on the current branch; no
+	// cross-session cached state. Used to bind delegate aliases to plan steps.
+	let latestPlan: PlanSnapshot | null = null;
+	const bindingsLogged = new Set<string>();
+	/** One concise source/capability diagnostic per loaded extension instance so
+	 * a stale install (e.g. an old ~/.pi extension lacking structured plans) is
+	 * diagnosable without repeating on every session. */
+	let startupDiagnosticShown = false;
+
 	/** Persist job MEMBERSHIP for this session branch (ids only — never a
 	 * second copy of job state). Restore scans branch entries only, so two
-	 * main sessions in the same cwd never inherit each other's jobs. */
-	function appendMembership(jobIds: string[]): void {
+	 * main sessions in the same cwd never inherit each other's jobs.
+	 * `bindings` is the additive job↔plan-step association; readers that only
+	 * read `jobIds` remain compatible. */
+	function appendMembership(jobIds: string[], bindings: PlanJobBinding[] = []): void {
 		const fresh = jobIds.filter((id) => !membershipLogged.has(id));
-		if (fresh.length === 0) return;
+		const freshBindings = bindings.filter((b) => !bindingsLogged.has(`${b.jobId}\u0000${b.stepId}`));
+		if (fresh.length === 0 && freshBindings.length === 0) return;
 		try {
 			for (const id of fresh) membershipLogged.add(id);
-			pi.appendEntry(PROGRESS_MEMBERSHIP_ENTRY_TYPE, { jobIds: fresh });
+			for (const b of freshBindings) bindingsLogged.add(`${b.jobId}\u0000${b.stepId}`);
+			const data: { jobIds: string[]; bindings?: PlanJobBinding[] } = { jobIds: fresh };
+			if (freshBindings.length > 0) data.bindings = freshBindings;
+			pi.appendEntry(PROGRESS_MEMBERSHIP_ENTRY_TYPE, data);
 		} catch {
 			/* membership persistence is best effort */
 		}
+	}
+
+	/** Current plan-step bindings for freshly created/referenced job ids: a step
+	 * binds when its id equals the job alias id or it lists the job in jobIds. */
+	function planBindingsForJobs(jobIds: string[]): PlanJobBinding[] {
+		if (!latestPlan) return [];
+		const out: PlanJobBinding[] = [];
+		for (const jobId of jobIds) {
+			for (const step of latestPlan.steps) {
+				if (step.id === jobId || step.jobIds.includes(jobId)) out.push({ jobId, stepId: step.id });
+			}
+		}
+		return out;
+	}
+
+	/** Branch-scoped plan read for the automatic fallback: latestPlan is the
+	 * live branch snapshot, but a fresh extension instance (no session_start
+	 * yet) can still recover from the branch. Never a cross-session cache. */
+	function readBranchPlan(ctx: ExtensionContext): PlanSnapshot | null {
+		try {
+			return readLatestPlan(ctx.sessionManager.getBranch() as readonly unknown[]);
+		} catch {
+			return null;
+		}
+	}
+
+	/** Best-effort structured-plan publication for a delegate call whose model
+	 * omitted `jobs action=plan`. Steps are derived from the created JobRecords
+	 * BEFORE any run starts; explicit plan steps always win (only missing steps
+	 * are appended, titles/statuses are never replaced). A publication that
+	 * cannot be made safe returns a diagnosis and NEVER blocks delegation. */
+	function autoPublishPlan(ctx: ExtensionContext, jobs: readonly JobRecord[], titles: ReadonlyMap<string, string>): { note?: string; bindings: PlanJobBinding[] } {
+		const jobIds = jobs.map((job) => job.jobId);
+		const previous = latestPlan ?? readBranchPlan(ctx);
+		const derivation = deriveAutoPlanSteps({
+			previous,
+			jobs: jobs.map((job) => ({ jobId: job.jobId, agent: job.agent, objective: job.objective, dependsOn: job.dependsOn, title: titles.get(job.jobId) })),
+		});
+		if (derivation.steps.length === 0) {
+			const note = derivation.diagnostics.length > 0 ? `structured plan: ${derivation.diagnostics.join("; ")}` : undefined;
+			return { note, bindings: planBindingsForJobs(jobIds) };
+		}
+		const revision = buildPlanSnapshot({ previous, steps: derivation.steps });
+		if (!revision.ok) {
+			return { note: `structured plan auto-publication skipped: ${revision.errors.join("; ")}`, bindings: planBindingsForJobs(jobIds) };
+		}
+		try {
+			pi.appendEntry(PLAN_ENTRY_TYPE, revision.snapshot);
+			latestPlan = revision.snapshot;
+		} catch (err) {
+			return { note: `structured plan auto-publication failed: ${(err as Error).message}`, bindings: planBindingsForJobs(jobIds) };
+		}
+		const note = derivation.diagnostics.length > 0 ? `structured plan: ${derivation.diagnostics.join("; ")}` : undefined;
+		return { note, bindings: planBindingsForJobs(jobIds) };
 	}
 
 	/** Track a job explicitly referenced by this session (jobs.wait/retry/
@@ -127,7 +210,7 @@ export default function (pi: ExtensionAPI) {
 			const job = orch?.store.readJob(jobId);
 			if (!job) return;
 			if (tracker.sync([job])) refreshProgressUI();
-			appendMembership([jobId]);
+			appendMembership([jobId], planBindingsForJobs([jobId]));
 		} catch {
 			/* best effort */
 		}
@@ -135,11 +218,17 @@ export default function (pi: ExtensionAPI) {
 
 	/** Restore tracked jobs from the CURRENT branch's membership entries only.
 	 * Raw store.readJob per id (no listJobs — its recovery mutates state),
-	 * finished included within the display budget (tracker prunes). */
+	 * finished included within the display budget (tracker prunes). Also
+	 * re-derives the active structured plan from `orchestrator.plan` entries. */
 	function restoreProgressFromBranch(ctx: ExtensionContext): void {
 		try {
-			const ids = collectMembershipJobIds(ctx.sessionManager.getBranch() as readonly unknown[]);
+			const branch = ctx.sessionManager.getBranch() as readonly unknown[];
+			const ids = collectMembershipJobIds(branch);
 			for (const id of ids) membershipLogged.add(id);
+			// Restore binding dedupe state too: otherwise a retry/followup after a
+			// reload re-appends an already-persisted binding-only membership entry.
+			for (const binding of collectMembershipBindings(branch)) bindingsLogged.add(`${binding.jobId}\u0000${binding.stepId}`);
+			latestPlan = readLatestPlan(branch);
 			const jobs = ids
 				.map((id) => orch?.store.readJob(id))
 				.filter((j): j is JobRecord => Boolean(j));
@@ -152,43 +241,28 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function paintProgressTask(task: ProgressTask, line: string): string {
-		const theme = uiCtx?.ui?.theme;
-		if (!theme) return line;
+	/** One-time cleanup for the removed above-editor Plan widget: a stale copy
+	 * from an older extension version is cleared on session start, branch
+	 * navigation, and shutdown. This key is never set to a non-empty payload
+	 * again — plan/progress detail lives in the workspace/sidebar view, and only
+	 * the compact footer status is owned here. */
+	function clearProgressWidget(ctx: ExtensionContext | null): void {
+		if (!ctx?.hasUI) return;
 		try {
-			switch (task.state) {
-				case "running":
-					return theme.fg("accent", line);
-				case "done":
-					return theme.fg("success", line);
-				case "failed":
-					return theme.fg("error", line);
-				case "blocked":
-					return theme.fg("warning", line);
-				case "cancelled":
-					return theme.fg("dim", line);
-				default:
-					return line;
-			}
+			ctx.ui.setWidget(PROGRESS_WIDGET_ID, undefined);
 		} catch {
-			return line;
+			/* progress UI must never break orchestration */
 		}
 	}
 
+	/** Project tracked jobs into the compact footer status only. */
 	function refreshProgressUI(): void {
 		const ctx = uiCtx;
 		if (!ctx) return;
 		try {
 			if (!ctx.hasUI) return;
 			const tasks = tracker.snapshot();
-			const lines = renderProgress(tasks, { paint: paintProgressTask });
-			if (lines.length === 0) {
-				ctx.ui.setWidget(PROGRESS_WIDGET_ID, undefined);
-				ctx.ui.setStatus(PROGRESS_STATUS_KEY, undefined);
-			} else {
-				ctx.ui.setWidget(PROGRESS_WIDGET_ID, lines, { placement: "aboveEditor" });
-				ctx.ui.setStatus(PROGRESS_STATUS_KEY, progressStatusText(tasks));
-			}
+			ctx.ui.setStatus(PROGRESS_STATUS_KEY, progressStatusText(tasks) || undefined);
 		} catch {
 			/* progress UI must never break orchestration */
 		}
@@ -220,6 +294,8 @@ export default function (pi: ExtensionAPI) {
 		unlistenProgress = null;
 		tracker = new ProgressTracker();
 		membershipLogged.clear();
+		bindingsLogged.clear();
+		latestPlan = null;
 	}
 
 	/** Stream real transition states for a single job into the tool's partial
@@ -322,9 +398,19 @@ export default function (pi: ExtensionAPI) {
 		// stay the sole source of truth — the tracker is a display projection.
 		resetProgress();
 		uiCtx = ctx;
+		clearProgressWidget(ctx);
 		attachProgressListener();
 		restoreProgressFromBranch(ctx);
-		if (!enforceMain) return;
+		// Concise startup diagnostic: which orchestrator source loaded and whether
+		// this build carries structured-plan publishing. No secrets, once per load.
+		const sourceDiagnostic = `src:${path.join(HERE, "index.ts")} · structured-plan:v${PLAN_SCHEMA_VERSION}`;
+		if (!enforceMain) {
+			if (!startupDiagnosticShown) {
+				startupDiagnosticShown = true;
+				ctx.ui.notify(`orchestrator: no main agent — lockdown INACTIVE · ${sourceDiagnostic}`, "info");
+			}
+			return;
+		}
 
 		const allToolNames = pi.getAllTools().map((tool) => tool.name);
 		pi.setActiveTools(allToolNames.filter((name) => ORCHESTRATOR_TOOLS.has(name)));
@@ -350,7 +436,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		ctx.ui.notify(
-			`orchestrator: main locked to delegate/jobs · ${agents.filter((a) => a.role === "sub").length} agents · models: ${registry?.aliases().join(", ") || "(none — using session model)"}`,
+			`orchestrator: main locked to delegate/jobs · ${agents.filter((a) => a.role === "sub").length} agents · models: ${registry?.aliases().join(", ") || "(none — using session model)"} · ${sourceDiagnostic}`,
 			"info",
 		);
 	});
@@ -359,11 +445,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		resetProgress();
 		uiCtx = null;
+		clearProgressWidget(ctx);
 		try {
-			if (ctx.hasUI) {
-				ctx.ui.setWidget(PROGRESS_WIDGET_ID, undefined);
-				ctx.ui.setStatus(PROGRESS_STATUS_KEY, undefined);
-			}
+			if (ctx.hasUI) ctx.ui.setStatus(PROGRESS_STATUS_KEY, undefined);
 		} catch {
 			/* best effort */
 		}
@@ -373,6 +457,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => {
 		resetProgress();
 		uiCtx = ctx;
+		clearProgressWidget(ctx);
 		attachProgressListener();
 		restoreProgressFromBranch(ctx);
 	});
@@ -440,6 +525,7 @@ export default function (pi: ExtensionAPI) {
 	const JobInput = Type.Object({
 		agent: Type.String({ description: "Sub agent name from the roster" }),
 		task: Type.String({ description: "Fully self-contained task: what to do, exact paths/symbols/commands, acceptance criteria" }),
+		title: Type.Optional(Type.String({ description: "Optional clear plan-step title for this job (defaults to the first sentence of task)" })),
 		context: Type.Optional(ContextSchema),
 		kind: Type.Optional(StringEnum(["implementation", "research", "test-writing", "debugging", "review", "other"] as const)),
 		id: Type.Optional(Type.String({ description: "Stable job id/alias for dependency references (auto-generated if omitted)" })),
@@ -464,12 +550,15 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Delegate jobs to sub agents (single or DAG batch); workers return validated structured results",
 		promptGuidelines: [
 			"Use delegate for ALL work requiring file access, commands, search, images, or code changes — the orchestrator has no direct tools.",
-			"Write delegate tasks for a focused cheap model with zero conversation context: exact paths, symbols, constraints, acceptance criteria.",
-			"Batch independent work into one delegate call with multiple jobs; express ordering with dependsOn instead of chain calls.",
+			"You own synthesis, diagnosis, and design; use delegate for bounded work — workers collect facts or implement decided changes, not open-ended architecture.",
+			"Write delegate tasks for a focused cheap model with zero conversation context: objective, exact targets, chosen approach/steps, boundaries/non-goals, expected cases, and the validation command.",
+			"Use delegate with the fewest coherent jobs: keep related changes and their specified tests together, batch only independent jobs with dependsOn, and never create one job per file or command.",
+			"Use delegate followup for related bounded corrections; let the automatic retry ladder handle execution errors and replan a bad specification instead of retrying it.",
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String()),
 			task: Type.Optional(Type.String()),
+			title: Type.Optional(Type.String({ description: "Optional clear plan-step title (falls back to the first sentence of task)" })),
 			context: Type.Optional(ContextSchema),
 			kind: Type.Optional(StringEnum(["implementation", "research", "test-writing", "debugging", "review", "other"] as const)),
 			id: Type.Optional(Type.String()),
@@ -516,9 +605,10 @@ export default function (pi: ExtensionAPI) {
 				if (hasSingle) {
 					const input = toInput({ ...params, agent: params.agent!, task: params.task! });
 					const job = o.createJob(input, agents);
-					appendMembership([job.jobId]);
+					const auto = autoPublishPlan(ctx, [job], params.title ? new Map([[job.jobId, params.title]]) : new Map());
+					appendMembership([job.jobId], auto.bindings);
 					try {
-						onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId} created (${params.agent}) — queued` }], details: { jobId: job.jobId } });
+						onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId} created (${params.agent}) — queued${auto.note ? `\n${auto.note}` : ""}` }], details: { jobId: job.jobId } });
 					} catch {
 						/* progress UI must never affect jobs */
 					}
@@ -543,10 +633,17 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text" as const, text: `Too many jobs (${params.jobs!.length}); max ${MAX_PARALLEL_TASKS}.` }], details: {}, isError: true };
 				}
 				const created: JobRecord[] = [];
-				for (const j of params.jobs!) created.push(o.createJob(toInput(j), agents));
-				appendMembership(created.map((c) => c.jobId));
+				const titleById = new Map<string, string>();
+				for (const j of params.jobs!) {
+					const record = o.createJob(toInput(j), agents);
+					created.push(record);
+					if (j.title) titleById.set(record.jobId, j.title);
+				}
+				const auto = autoPublishPlan(ctx, created, titleById);
+				const createdIds = created.map((c) => c.jobId);
+				appendMembership(createdIds, auto.bindings);
 				try {
-					onUpdate?.({ content: [{ type: "text" as const, text: `created ${created.length} jobs — running DAG…` }], details: { jobIds: created.map((c) => c.jobId) } });
+					onUpdate?.({ content: [{ type: "text" as const, text: `created ${created.length} jobs — running DAG…${auto.note ? `\n${auto.note}` : ""}` }], details: { jobIds: createdIds } });
 				} catch {
 					/* progress UI must never affect jobs */
 				}
@@ -611,15 +708,17 @@ export default function (pi: ExtensionAPI) {
 		name: "jobs",
 		label: "Jobs",
 		description:
-			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> | metrics.",
-		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/followup/retry/cancel/wait/metrics",
+			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> | plan steps=[...] (publish/revise the structured plan) | metrics.",
+		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/followup/retry/cancel/wait/plan/metrics",
 		promptGuidelines: [
+			"Publish the structured plan with jobs action=plan BEFORE delegating for any multi-step task; each step needs a stable id and a clear human-readable title, and the step id should equal the delegate job alias id (delegate id=...) so the workspace can bind them.",
+			"Omit unchanged steps when revising a plan — they are retained; only real changes need a new revision, and statuses advance planned → running → completed/failed/blocked/cancelled/superseded.",
 			"Use jobs.followup for small corrections (resumes the worker's session); use jobs.retry strategy=fresh when the worker is stuck, optionally escalating model (worker-best, frontier).",
 			"Use jobs.read and jobs.artifact to pull details on demand — never request full logs into context.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(
-				["list", "status", "read", "artifact", "graph", "events", "attempts", "followup", "retry", "cancel", "wait", "metrics"] as const,
+				["list", "status", "read", "artifact", "graph", "events", "attempts", "followup", "retry", "cancel", "wait", "plan", "metrics"] as const,
 			),
 			jobId: Type.Optional(Type.String()),
 			path: Type.Optional(Type.String({ description: "artifact relative path (action: artifact)" })),
@@ -627,6 +726,20 @@ export default function (pi: ExtensionAPI) {
 			message: Type.Optional(Type.String({ description: "follow-up instruction (action: followup)" })),
 			strategy: Type.Optional(StringEnum(["resume", "fresh"] as const, { description: "retry strategy (default: fresh)" })),
 			model: Type.Optional(Type.String({ description: "logical alias override for retry (worker-cheap/worker-best/frontier)" })),
+			planId: Type.Optional(Type.String({ description: "stable plan id (omit to continue the current branch's plan)" })),
+			steps: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.String({ description: "stable step id; use the delegate job alias id to bind step ↔ job" }),
+						title: Type.String({ description: "clear human-readable title (what changes, not 'step 1')" }),
+						agent: Type.Optional(Type.String({ description: "sub agent name from the roster" })),
+						dependsOn: Type.Optional(Type.Array(Type.String(), { description: "step ids that must finish first" })),
+						jobIds: Type.Optional(Type.Array(Type.String(), { description: "existing job ids this step links to" })),
+						status: Type.Optional(StringEnum(PLAN_STEP_STATUSES, { description: "declared step status (default: planned)" })),
+					}),
+					{ description: "plan revision steps (max 64); omitted previous steps are retained" },
+				),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -643,6 +756,47 @@ export default function (pi: ExtensionAPI) {
 			const needsId = () => t("jobId is required for this action.");
 			try {
 				switch (params.action) {
+					case "plan": {
+						// Validate EVERYTHING before the first append, so a rejected plan
+						// writes no session entry and never advances the revision.
+						const revision = buildPlanSnapshot({ previous: latestPlan, planId: params.planId, steps: params.steps ?? [] });
+						if (!revision.ok) {
+							return {
+								content: [{ type: "text" as const, text: `plan rejected (no entry written):\n- ${revision.errors.join("\n- ")}` }],
+								details: {},
+								isError: true,
+							};
+						}
+						const snapshot = revision.snapshot;
+						pi.appendEntry(PLAN_ENTRY_TYPE, snapshot);
+						latestPlan = snapshot;
+						// Explicit jobIds AND alias-matching existing jobs become stable
+						// membership bindings (job↔step), and the compact summary shows the
+						// effective live job state. The persisted snapshot stays declared-only.
+						const bindings: PlanJobBinding[] = [];
+						const membershipIds = new Set<string>();
+						const live: Record<string, string> = {};
+						for (const step of snapshot.steps) {
+							for (const jobId of step.jobIds) {
+								bindings.push({ jobId, stepId: step.id });
+								membershipIds.add(jobId);
+								if (live[jobId] === undefined) {
+									const job = o.store.readJob(jobId);
+									if (job) live[jobId] = job.status;
+								}
+							}
+							if (live[step.id] === undefined) {
+								const aliasJob = o.store.readJob(step.id);
+								if (aliasJob) {
+									live[step.id] = aliasJob.status;
+									bindings.push({ jobId: step.id, stepId: step.id });
+									membershipIds.add(step.id);
+								}
+							}
+						}
+						appendMembership([...membershipIds], bindings);
+						return t(renderPlanSummary(snapshot, live));
+					}
 					case "list": {
 						const jobs = o.listJobs().slice(0, 30);
 						if (jobs.length === 0) return t("No jobs yet.");

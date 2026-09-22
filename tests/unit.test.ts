@@ -18,8 +18,10 @@ import { extractResult, renderReportMd } from "../core/result.ts";
 import { Router } from "../core/routing.ts";
 import { atomicWriteJson, JobStore, readJson } from "../core/storage.ts";
 import { buildContextPack } from "../core/context.ts";
+import { fitDependencyHandoffs } from "../core/orchestrator.ts";
+import { renderDependencySection } from "../core/prompts.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "../core/telemetry.ts";
-import { DEFAULT_RETRY, normalizeJobResult, type AttemptRecord, type JobRecord } from "../core/types.ts";
+import { DEFAULT_RETRY, normalizeJobResult, type AttemptRecord, type DependencyHandoff, type JobRecord } from "../core/types.ts";
 import { makeHarness, TEST_MODELS_YAML, tmpRoot, writeRegistry } from "./helpers.ts";
 
 // ── Model registry ──────────────────────────────────────────────────────────
@@ -444,6 +446,77 @@ describe("buildContextPack", () => {
 		assert.equal(built.inlinedFiles.length, 1); // big.md too large, traversal skipped
 		assert.equal(built.inlinedFiles[0].path, "docs/frontend.md");
 		assert.equal(built.pack.objective, "fix x");
+	});
+
+	it("passes optional dependency handoffs through unchanged", () => {
+		const dependencies: DependencyHandoff[] = [
+			{
+				jobId: "pred",
+				agent: "coder",
+				status: "success",
+				summary: "did a thing",
+				findings: [{ message: "f", evidence: "a.ts:1" }],
+				changedPaths: ["a.ts"],
+				validation: "passed",
+				artifacts: ["/root/jobs/pred/artifacts/diff.patch"],
+				resultPath: "/root/jobs/pred/result.json",
+			},
+		];
+		const built = buildContextPack({
+			objective: "dependent",
+			context: { dependencies, dependenciesOmitted: 2 },
+			agentContext: { mode: "none" },
+			workspaceDir: tmpRoot(),
+		});
+		assert.deepEqual(built.pack.dependencies, dependencies);
+		assert.equal(built.pack.dependenciesOmitted, 2);
+	});
+
+	it("leaves dependency fields undefined for legacy context without them", () => {
+		const built = buildContextPack({ objective: "legacy", context: { background: "old" }, agentContext: { mode: "none" }, workspaceDir: tmpRoot() });
+		assert.equal(built.pack.dependencies, undefined);
+		assert.equal(built.pack.dependenciesOmitted, undefined);
+		assert.equal(built.pack.background, "old");
+	});
+});
+
+describe("bounded dependency handoff budget", () => {
+	it("omits one oversized record and still counts it when no detail record fits", () => {
+		const oversized: DependencyHandoff = {
+			jobId: "pred",
+			agent: "worker",
+			status: "success",
+			summary: "s",
+			findings: [],
+			changedPaths: [],
+			validation: "passed",
+			artifacts: [`/${"a".repeat(20_000)}`],
+			resultPath: `/root/${"r".repeat(20_000)}/result.json`,
+		};
+		const fit = fitDependencyHandoffs([oversized], 1);
+		assert.equal(fit.dependencies.length, 0);
+		assert.equal(fit.omitted, 1);
+		const section = renderDependencySection(fit.dependencies, fit.omitted);
+		assert.ok(Buffer.byteLength(section, "utf8") <= 24 * 1024, "omitted-only section must still fit");
+		assert.match(section, /1 prerequisite record\(s\) omitted/);
+	});
+
+	it("keeps whole records with whole references when they fit", () => {
+		const record: DependencyHandoff = {
+			jobId: "pred",
+			agent: "worker",
+			status: "success",
+			summary: "ok",
+			findings: [{ message: "f", evidence: "a.ts:1" }],
+			changedPaths: ["a.ts"],
+			validation: "passed",
+			artifacts: ["/root/jobs/pred/artifacts/diff.patch"],
+			resultPath: "/root/jobs/pred/result.json",
+		};
+		const fit = fitDependencyHandoffs([record], 2);
+		assert.equal(fit.dependencies.length, 1);
+		assert.equal(fit.omitted, 1);
+		assert.match(renderDependencySection(fit.dependencies, fit.omitted), /\/root\/jobs\/pred\/result\.json/);
 	});
 });
 

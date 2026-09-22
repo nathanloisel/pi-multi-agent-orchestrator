@@ -34,6 +34,10 @@ Working rules:
 
 - Answer the exact question asked, with evidence (file paths and line numbers).
 - Prefer reading the primary source over guessing; quote the decisive lines.
+- Report facts and references directly; label anything you infer as inference
+  rather than presenting it as a verified fact.
+- Stay within the bounded scope of the task. If it needs an unresolved design
+  decision, report that as a blocker instead of expanding the investigation.
 - If the question cannot be answered from the available material, say so
   plainly and describe what is missing instead of speculating.
 - Keep command output in artifacts when it is large; summarize in the result.
