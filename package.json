@@ -26,7 +26,8 @@
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"test": "tsx --test tests/*.test.ts",
-		"release:check": "npm run typecheck && npm test"
+		"release:check": "npm run typecheck && npm test",
+		"pi:test-version": "node scripts/install-pi-test-version.mjs"
 	},
 	"dependencies": {
 		"yaml": "^2.9.0"

@@ -44,6 +44,48 @@ Ask your main agent as you would ask a colleague:
 
 It picks suitable workers, runs the jobs, tracks them, and reports the results. While jobs run, a live progress display above the editor shows job state in real time. You can also ask "Show current jobs" or "Retry the failed job".
 
+## Pi version compatibility
+
+This extension is validated against real pi releases, not just the version in
+your lockfile:
+
+- **Baseline (lockfile):** pi `0.85.1` — what `npm ci` installs for local dev.
+- **Current target:** pi `0.87.0` — required to pass before releases.
+- **Latest canary:** `latest` runs weekly in CI and on every manual dispatch;
+  a new pi that breaks this extension turns that job red (no allow-failure).
+
+CI runs the suite on a Node 22/24 × pi version matrix (`0.85.1`, `0.87.0`,
+`latest`) and prints the versions actually tested. The npm dependency and the
+`pi` binary you interact with are different things: the lockfile pins the
+installed `@earendil-works/pi-coding-agent` package, while the global `pi`
+command comes from your own install and can be newer.
+
+To test a specific pi version locally without touching the manifest or the
+reproducible baseline lockfile:
+
+```bash
+npm ci                                   # reproducible baseline (0.85.1)
+npm run pi:test-version -- 0.87.0        # overlay node_modules with pi 0.87.0 + matching peers
+npm run release:check                    # typecheck + tests against 0.87.0
+npm run pi:test-version -- latest        # or the newest published release
+npm run release:check
+npm ci                                   # back to the baseline lock
+```
+
+The overlay script resolves the selected release and installs its own declared
+peer versions (`pi-ai`, `pi-tui`, `typebox`) with `--no-save
+--package-lock=false`, so peer versions always match the selected pi instead of
+assuming one shared version.
+
+Compatibility policy: the tests launch the real pi CLI in RPC mode (isolated
+temp environment, no model calls, no spend) and assert the public surfaces this
+extension uses — slash-command registration, tool registration/activation, and
+the native extension-UI envelopes. Optional UI affordances already guard with
+`hasUI`/`ctx.mode` capability checks rather than version branches; keep it that
+way for new optional APIs. There is no universal future guarantee: a breaking
+future pi requires a maintenance release, and the `latest` canary exists to
+surface that immediately.
+
 ## Live messaging (no tmux)
 
 Workers are normal Pi sessions in RPC mode, so the orchestrator wires their live
