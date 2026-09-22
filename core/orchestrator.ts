@@ -13,7 +13,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { AgentsViewExporter } from "./agentsview.ts";
 import { BudgetManager } from "./budget.ts";
 import { ConcurrencyManager } from "./concurrency.ts";
 import { EventLog, type EventType } from "./events.ts";
@@ -61,7 +60,6 @@ export interface OrchestratorConfig {
 	};
 	/** Worker execution seam — tests inject a fake runner; default spawns pi. */
 	workerRunner?: (req: SpawnRequest) => Promise<SpawnOutcome>;
-	agentsViewExporter?: AgentsViewExporter;
 	plannerTelemetry?: PlannerTelemetryStore;
 }
 
@@ -141,7 +139,6 @@ export class Orchestrator {
 		this.events = config.events;
 		this.store.setRecoveryHandler((job, attempt) => {
 			this.events.append(job.jobId, "job.interrupted", { reason: "orchestrator_process_terminated" }, attempt.attemptId);
-			this.config.agentsViewExporter?.export(job, attempt);
 		});
 	}
 
@@ -162,21 +159,6 @@ export class Orchestrator {
 				byModel: [],
 			},
 		};
-	}
-
-	/** AgentsView backfill: export attempts that predate exporter activation
-	 * (e.g. the bridge was enabled after jobs already ran). Safe + idempotent —
-	 * the exporter replaces existing job/attempt manifest entries. */
-	backfillAgentsView(): number {
-		const exporter = this.config.agentsViewExporter;
-		if (!exporter) return 0;
-		let exported = 0;
-		for (const job of this.store.listJobs()) {
-			for (const attempt of this.store.listAttempts(job.jobId)) {
-				if (exporter.export(job, attempt)) exported++;
-			}
-		}
-		return exported;
 	}
 
 	private agentByName(agents: AgentConfig[], name: string): AgentConfig {
@@ -692,7 +674,6 @@ export class Orchestrator {
 		job.startedAt = job.startedAt ?? Date.now();
 		store.writeJob(job);
 		this.events.append(job.jobId, "attempt.started", { agent: agent.name, model: decision.alias, resolved: attempt.resolvedModel, strategy: decision.strategy, reason: decision.reason }, attemptId);
-		this.config.agentsViewExporter?.export(job, attempt);
 
 		// ── workspace (§14)
 		let workspace = attempt.workspace;
@@ -911,7 +892,6 @@ export class Orchestrator {
 			this.store.writeJob(job);
 		}
 
-		this.config.agentsViewExporter?.export(job, attempt);
 		const attempts = store.listAttempts(job.jobId);
 		return {
 			jobId: job.jobId,

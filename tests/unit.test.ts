@@ -10,7 +10,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { once } from "node:events";
-import { AgentsViewExporter } from "../core/agentsview.ts";
 import { BudgetManager } from "../core/budget.ts";
 import { ConcurrencyManager, Gate } from "../core/concurrency.ts";
 import { classifyRunFailure, OrchestratorError } from "../core/errors.ts";
@@ -22,20 +21,8 @@ import { buildContextPack } from "../core/context.ts";
 import { fitDependencyHandoffs } from "../core/orchestrator.ts";
 import { renderDependencySection } from "../core/prompts.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "../core/telemetry.ts";
-import { DEFAULT_RETRY, emptyValidation, normalizeJobResult, type AttemptRecord, type DependencyHandoff, type JobRecord } from "../core/types.ts";
-import { makeAgent, makeHarness, outcome, TEST_MODELS_YAML, tmpRoot, writeRegistry, writingWorker } from "./helpers.ts";
-
-const successResult = {
-	status: "success" as const,
-	summary: "done",
-	findings: [],
-	changes: [],
-	validation: emptyValidation(),
-	artifacts: [],
-	blockers: [],
-	followUps: [],
-	metrics: {},
-};
+import { DEFAULT_RETRY, normalizeJobResult, type AttemptRecord, type DependencyHandoff, type JobRecord } from "../core/types.ts";
+import { makeHarness, TEST_MODELS_YAML, tmpRoot, writeRegistry } from "./helpers.ts";
 
 // ── Model registry ──────────────────────────────────────────────────────────
 
@@ -417,127 +404,9 @@ describe("planner telemetry", () => {
 	});
 });
 
-describe("AgentsView Pi bridge", () => {
-	it("atomically exports a nested Pi JSONL session with stable metadata and private modes", () => {
-		const root = tmpRoot();
-		const store = new JobStore(root);
-		store.createJobDir("job-one");
-		const attemptId = store.allocateAttempt("job-one");
-		const sessionDir = store.sessionDir("job-one", attemptId);
-		const source = path.join(sessionDir, "native.jsonl");
-		fs.writeFileSync(source, [
-			JSON.stringify({ type: "session", version: 3, id: "job-one-attempt-001", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/repo" }),
-			JSON.stringify({ type: "message", id: "u1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "work" } }),
-			JSON.stringify({ type: "message", id: "a1", parentId: "u1", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "done" }], provider: "openrouter", model: "z-ai/glm-5.3-flash", usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 0, totalTokens: 15, cost: { total: 0.01 } }, stopReason: "stop" } }),
-		].join("\n") + "\n");
-		const exportDir = path.join(root, "agentsview-sessions");
-		const exporter = new AgentsViewExporter({ enabled: true, exportDir });
-		const job = mkJob({ jobId: "job-one", cwd: "/repo", objective: "work", status: "running" });
-		const attempt = mkAttempt({ jobId: "job-one", attemptId, agent: "coder", status: "success", provider: "openrouter", resolvedModel: "openrouter/z-ai/glm-5.3-flash", sessionDir, completedAt: 2000 });
-		const record = exporter.export(job, attempt);
-		assert.ok(record);
-		assert.equal(record.sessionPath, path.join(exportDir, "orchestrator", `${job.jobId}--${attempt.attemptId}.jsonl`));
-		const lines = fs.readFileSync(record.sessionPath, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
-		assert.equal(lines[0].type, "session");
-		assert.equal(lines[0].id, "job-one-attempt-001");
-		assert.match(lines[0].title, /coder.*job-one\/attempt-001.*success/);
-		assert.equal(lines[0].orchestrator.sourceSessionPath, source);
-		assert.equal(lines[2].message.model, "z-ai/glm-5.3-flash", "AgentsView Pi parser reads inline assistant model");
-		assert.equal(lines[2].message.usage.cacheRead, 3, "AgentsView Pi parser reads flat cache usage");
-		assert.equal(fs.readdirSync(path.dirname(record.sessionPath)).some((name) => name.endsWith(".tmp")), false);
-		// private permissions on the nested project dir, the JSONL and the manifest
-		assert.equal(fs.statSync(path.dirname(record.sessionPath)).mode & 0o777, 0o700);
-		assert.equal(fs.statSync(record.sessionPath).mode & 0o777, 0o600);
-		const manifest = readJson<Array<{ jobId: string; attemptId: string; agent: string }>>(path.join(exportDir, "orchestrator-sessions.json"));
-		assert.deepEqual(manifest, [{ ...record }]);
-	});
-
-	it("is default-safe when disabled", () => {
-		const root = tmpRoot();
-		const exporter = new AgentsViewExporter({ enabled: false, exportDir: path.join(root, "export") });
-		assert.equal(exporter.export(mkJob(), mkAttempt()), undefined);
-		assert.equal(fs.existsSync(path.join(root, "export")), false);
-	});
-
-	it("backfills existing attempts on activation, idempotently, with 0600 files", async () => {
-		const h1 = makeHarness();
-		h1.setWorker(writingWorker(() => outcome({ ...successResult, summary: "legacy work done" })));
-		const job = h1.orch.createJob({ agent: "worker", task: "legacy work" }, h1.agents);
-		await h1.orch.runJob(job, h1.agents);
-
-		// exporter enabled later ("reload"): a fresh orchestrator over the same store
-		const exportDir = path.join(h1.root, "agentsview-sessions");
-		// simulate the previous flat layout so backfill must migrate it
-		const legacyFlat = path.join(exportDir, `${job.jobId}--attempt-001.jsonl`);
-		fs.mkdirSync(exportDir, { recursive: true });
-		fs.writeFileSync(legacyFlat, "{}\n");
-		const h2 = makeHarness({ root: h1.root, agentsView: { enabled: true, exportDir } });
-		assert.equal(h2.orch.backfillAgentsView(), 1);
-
-		assert.equal(fs.existsSync(legacyFlat), false, "legacy flat JSONL removed after successful nested write");
-		assert.equal(fs.existsSync(path.join(exportDir, "orchestrator", `${job.jobId}--attempt-001.jsonl`)), true);
-
-		const manifest = readJson<Array<{ jobId: string; attemptId: string; status: string; sessionPath: string }>>(path.join(exportDir, "orchestrator-sessions.json"));
-		assert.equal(manifest?.length, 1);
-		assert.equal(manifest![0].jobId, job.jobId);
-		assert.equal(manifest![0].status, "success");
-		// private permissions on both the JSONL projection and the manifest
-		assert.equal(fs.statSync(manifest![0].sessionPath).mode & 0o777, 0o600);
-		assert.equal(fs.statSync(path.join(exportDir, "orchestrator-sessions.json")).mode & 0o777, 0o600);
-
-		// idempotent: no duplicate manifest entries, count unchanged
-		assert.equal(h2.orch.backfillAgentsView(), 1);
-		const manifest2 = readJson<Array<unknown>>(path.join(exportDir, "orchestrator-sessions.json"));
-		assert.equal(manifest2?.length, 1);
-
-		// exporter without a store (no orchestrator wiring) stays a no-op
-		assert.equal(h2.orch.config.agentsViewExporter !== undefined, true);
-		h2.cleanup();
-		h1.cleanup();
-	});
-
-	it("re-exporting the same attempt replaces the manifest entry without duplicates", () => {
-		const root = tmpRoot();
-		const store = new JobStore(root);
-		store.createJobDir("job-two");
-		const exportDir = path.join(root, "export");
-		const exporter = new AgentsViewExporter({ enabled: true, exportDir });
-		const job = mkJob({ jobId: "job-two", objective: "obj" });
-		const attempt = mkAttempt({ jobId: "job-two", status: "running" });
-		exporter.export(job, attempt);
-		exporter.export(job, { ...attempt, status: "success" as const, completedAt: 123 });
-		const manifest = readJson<Array<{ jobId: string; attemptId: string; status: string; completedAt?: number; sessionPath: string }>>(path.join(exportDir, "orchestrator-sessions.json"));
-		assert.equal(manifest?.length, 1);
-		assert.equal(manifest![0].status, "success");
-		assert.equal(manifest![0].completedAt, 123);
-		assert.equal(path.dirname(manifest![0].sessionPath), path.join(exportDir, "orchestrator"));
-		fs.rmSync(root, { recursive: true, force: true });
-	});
-
-	it("exports into the <root>/<project>/<session>.jsonl discovery layout (no root-level session files)", () => {
-		const root = tmpRoot();
-		const exportDir = path.join(root, "agentsview-sessions");
-		const exporter = new AgentsViewExporter({ enabled: true, exportDir });
-		const job = mkJob({ jobId: "layout-job", objective: "obj" });
-		const attempt = mkAttempt({ jobId: "layout-job", status: "running" });
-		const record = exporter.export(job, attempt);
-		assert.ok(record);
-		// Installed AgentsView (v0.41.1) DirectoryJSONLSourceSet.IsDirectoryJSONLPath:
-		// a session is discovered only when its path relative to the configured root
-		// is exactly <project>/<session>.jsonl (2 components, neither empty).
-		const rel = path.relative(exportDir, record.sessionPath);
-		const parts = rel.split(path.sep);
-		assert.equal(parts.length, 2, `expected <project>/<session>.jsonl, got ${rel}`);
-		assert.ok(parts[0] && parts[0] !== "." && parts[0] !== "..");
-		assert.equal(parts[0], "orchestrator");
-		assert.ok(parts[1] && parts[1]!.endsWith(".jsonl"));
-		// no root-level session files — those would be rejected by the parser
-		assert.deepEqual(fs.readdirSync(exportDir).filter((name) => name.endsWith(".jsonl")), []);
-		fs.rmSync(root, { recursive: true, force: true });
-	});
-
-	it("recovery of an interrupted attempt exports through the configured exporter", async () => {
-		const h = makeHarness({ agentsView: { enabled: true } });
+describe("interrupted-attempt recovery", () => {
+	it("recovery of an interrupted attempt appends a job.interrupted event", async () => {
+		const h = makeHarness();
 		const job = h.orch.createJob({ agent: "worker", task: "will crash" }, h.agents);
 		const attemptId = h.orch.store.allocateAttempt(job.jobId);
 		h.orch.store.writeAttempt({
@@ -555,9 +424,8 @@ describe("AgentsView Pi bridge", () => {
 
 		const reloaded = h.orch.readJob(job.jobId);
 		assert.equal(reloaded?.status, "interrupted");
-		const manifest = readJson<Array<{ jobId: string; attemptId: string; status: string }>>(path.join(h.root, "agentsview-sessions", "orchestrator-sessions.json"));
-		assert.equal(manifest?.length, 1);
-		assert.equal(manifest![0].status, "interrupted");
+		const events = h.orch.events.read(job.jobId, 100);
+		assert.ok(events.some((e) => e.type === "job.interrupted"));
 		h.cleanup();
 	});
 });

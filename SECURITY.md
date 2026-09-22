@@ -30,13 +30,6 @@ variables (e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`), referenced from
 (`apiKeyEnv`). Never put literal tokens into `models.yaml`, `config.yaml`, or
 agent `AGENT.md` files.
 
-## AgentsView integration is opt-in
-
-The AgentsView bridge (`agentsView.enabled`) is **disabled by default**. When
-enabled, it exports worker session transcripts to a local directory you
-choose; nothing is sent anywhere. Enable it only if you understand that
-sub-agent session content will be duplicated to that directory.
-
 ## Reporting a vulnerability
 
 Please report security issues responsibly via

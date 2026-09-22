@@ -182,27 +182,7 @@ main extension, preventing double counting. `jobs` action `metrics` and
 `Orchestrator.metrics()` expose both planner and per-agent×alias worker totals.
 No learned router in V1.
 
-## 11. AgentsView projection
-
-AgentsView supports Pi JSONL discovery but no custom orchestrator-agent plugin
-contract. With `agentsView.enabled: true`, attempts are atomically projected to
-`<exportDir>/orchestrator/<jobId>--<attemptId>.jsonl` (the
-`<root>/<project>/<session>` layout AgentsView's installed parser requires —
-root-level session files are rejected) plus an `orchestrator-sessions.json`
-metadata sidecar at the export root. At orchestrator activation/reload,
-existing attempts are backfilled (idempotently — re-exports replace their
-manifest entry, legacy flat JSONL files are removed after their nested
-replacement is written), so subagents that ran before the bridge was enabled
-become visible too. Export JSONL and manifest files are written with private
-`0600` permissions and the `orchestrator` project directory is `0700`, both
-after the atomic rename.
-Native worker transcripts are copied when present; running attempts use a
-truthful metadata/objective-only Pi session until then. Configure that directory
-under AgentsView's supported `[agents.pi].dirs` list. Sessions are shown as Pi,
-with subagent/job/attempt/status in the title; the sidecar retains exact agent,
-model, provider, timestamps, and source/session paths.
-
-## 12. Transport exhaustion and recovery
+## 11. Transport exhaustion and recovery
 
 Provider-level retries remain inside one attempt. If they exhaust with
 `provider_unavailable`/`transport_error`, the job enters explicit, inspectable
@@ -210,7 +190,7 @@ Provider-level retries remain inside one attempt. If they exhaust with
 running attempt; reload marks it `interrupted`, emits `job.interrupted`, and a
 fresh retry allocates a new attempt while retaining the interrupted record.
 
-## 13. Runtime API (§24, UI-independent)
+## 12. Runtime API (§24, UI-independent)
 
 `Orchestrator` (core/orchestrator.ts): createJob, listJobs, readJob,
 readAttempt, readResult, readArtifact, runJob, runGraph, followupJob, retryJob,

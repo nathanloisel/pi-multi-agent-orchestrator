@@ -9,7 +9,6 @@ import * as path from "node:path";
 import { BudgetManager } from "../core/budget.ts";
 import { ConcurrencyManager } from "../core/concurrency.ts";
 import { EventLog } from "../core/events.ts";
-import { AgentsViewExporter } from "../core/agentsview.ts";
 import { ModelRegistry } from "../core/models.ts";
 import { Orchestrator, type OrchestratorConfig } from "../core/orchestrator.ts";
 import { Router, type RoutingRule } from "../core/routing.ts";
@@ -112,7 +111,7 @@ export interface Harness {
 	cleanup(): void;
 }
 
-export function makeHarness(opts: { root?: string; rules?: RoutingRule[]; agents?: AgentConfig[]; concurrency?: { global: number; byModel: Record<string, number> }; agentsView?: { enabled: boolean; exportDir?: string } } = {}): Harness {
+export function makeHarness(opts: { root?: string; rules?: RoutingRule[]; agents?: AgentConfig[]; concurrency?: { global: number; byModel: Record<string, number> } } = {}): Harness {
 	const root = opts.root ?? tmpRoot();
 	writeRegistry(root, TEST_MODELS_YAML);
 	const registry = new ModelRegistry(root);
@@ -124,9 +123,6 @@ export function makeHarness(opts: { root?: string; rules?: RoutingRule[]; agents
 
 	const config: OrchestratorConfig = {
 		root,
-		agentsViewExporter: opts.agentsView
-			? new AgentsViewExporter({ enabled: opts.agentsView.enabled, exportDir: opts.agentsView.exportDir ?? path.join(root, "agentsview-sessions") })
-			: undefined,
 		workerExtensionPath: path.join(root, "worker.ts"),
 		agentsRoot: path.join(root, "agents"),
 		registry,

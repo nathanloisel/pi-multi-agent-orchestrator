@@ -17,7 +17,6 @@
 
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import * as os from "node:os";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -39,7 +38,6 @@ import {
 	stateFromEventType,
 } from "./core/progress.ts";
 import { EventLog } from "./core/events.ts";
-import { AgentsViewExporter } from "./core/agentsview.ts";
 import { BudgetManager } from "./core/budget.ts";
 import { ConcurrencyManager } from "./core/concurrency.ts";
 import { Orchestrator, type CreateJobInput, type RunReport } from "./core/orchestrator.ts";
@@ -77,7 +75,6 @@ interface LoadedConfig {
 	concurrency: ConcurrencyConfig;
 	budgets: { perAttemptUsd?: number; perJobUsd?: number; dailyUsd?: number };
 	routing: RoutingRule[];
-	agentsView: { enabled: boolean; exportDir: string };
 }
 
 function loadOrchestratorConfig(root: string): LoadedConfig {
@@ -87,15 +84,10 @@ function loadOrchestratorConfig(root: string): LoadedConfig {
 		try {
 			const raw = fs.readFileSync(file, "utf-8");
 			const cfg = name.endsWith(".json") ? JSON.parse(raw) : yamlParse(raw);
-			const configuredExportDir = typeof cfg.agentsView?.exportDir === "string" ? cfg.agentsView.exportDir : path.join(root, "agentsview-sessions");
 			return {
 				concurrency: { ...DEFAULT_CONCURRENCY, ...(cfg.concurrency ?? {}) },
 				budgets: cfg.budgets ?? {},
 				routing: Array.isArray(cfg.routing?.rules) ? cfg.routing.rules : [],
-				agentsView: {
-					enabled: cfg.agentsView?.enabled === true,
-					exportDir: configuredExportDir.startsWith("~/") ? path.join(os.homedir(), configuredExportDir.slice(2)) : configuredExportDir,
-				},
 			};
 		} catch {
 			/* fall through to defaults */
@@ -105,7 +97,6 @@ function loadOrchestratorConfig(root: string): LoadedConfig {
 		concurrency: { ...DEFAULT_CONCURRENCY },
 		budgets: {},
 		routing: [],
-		agentsView: { enabled: false, exportDir: path.join(root, "agentsview-sessions") },
 	};
 }
 
@@ -355,17 +346,9 @@ export default function (pi: ExtensionAPI) {
 			budgets: new BudgetManager(root),
 			events: new EventLog(store.jobsDir()),
 			store,
-			agentsViewExporter: new AgentsViewExporter(cfg.agentsView),
 			plannerTelemetry: plannerStore,
 			defaults: { model: sessionModel, budget: cfg.budgets, concurrency: cfg.concurrency },
 		});
-		// Backfill: attempts that predate AgentsView activation become visible too.
-		try {
-			orch.backfillAgentsView();
-		} catch (err) {
-			// eslint-disable-next-line no-console
-			console.error("[orchestrator] AgentsView backfill failed:", err);
-		}
 		for (const reg of registry.providerRegistrations()) {
 			try {
 				pi.registerProvider(reg.name, reg.config);
