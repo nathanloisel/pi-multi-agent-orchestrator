@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BudgetManager } from "./budget.ts";
 import { ConcurrencyManager } from "./concurrency.ts";
+import { MessageBroker, type AttentionItem, type HumanQuestionHandler, type InboxItem } from "./broker.ts";
 import { EventLog, type EventType } from "./events.ts";
 import { OrchestratorError } from "./errors.ts";
 import { ModelRegistry, type LaunchConfig } from "./models.ts";
@@ -132,11 +133,14 @@ export interface RunReport {
 export class Orchestrator {
 	readonly store: JobStore;
 	readonly events: EventLog;
+	/** Parent-side live messaging broker (phase 2): jobs message/inbox/reply + attention. */
+	readonly broker: MessageBroker;
 	private cancels = new Map<string, AbortController>();
 
 	constructor(public config: OrchestratorConfig) {
 		this.store = config.store;
 		this.events = config.events;
+		this.broker = new MessageBroker(config.events);
 		this.store.setRecoveryHandler((job, attempt) => {
 			this.events.append(job.jobId, "job.interrupted", { reason: "orchestrator_process_terminated" }, attempt.attemptId);
 		});
@@ -282,10 +286,64 @@ export class Orchestrator {
 		return true;
 	}
 
+	// ── Live messaging (phase 2: broker surface) ────────────────────────────────
+
+	/**
+	 * Send a one-way main→worker message by steering the job's LIVE worker.
+	 * Resolves only after the worker ACKs the steer (no delivery claim before
+	 * that); throws explicit errors for unknown jobs, jobs that are not
+	 * running, and workers that refuse the steer.
+	 *
+	 * Reads raw store state on purpose: crash-recovery reads would falsely mark
+	 * a legitimately RUNNING attempt interrupted here.
+	 */
+	async messageJob(jobId: string, text: string): Promise<void> {
+		const job = this.store.readJob(jobId);
+		if (!job) throw new OrchestratorError("unknown", `Unknown job ${jobId}`);
+		if (statusIsTerminal(job.status)) {
+			throw new OrchestratorError("unknown", `Job ${jobId} is ${job.status}; only running jobs have a live worker to message`);
+		}
+		if (job.status !== "running") {
+			throw new OrchestratorError("unknown", `Job ${jobId} is ${job.status}, not running — there is no live worker to message. Use delegate or jobs followup instead.`);
+		}
+		await this.broker.steerJob(jobId, text);
+	}
+
+	/**
+	 * Read the bounded message/request inbox (optionally one job). Reading
+	 * consumes attention: surfaced items never re-yield a blocking call.
+	 */
+	inbox(jobId?: string): InboxItem[] {
+		return this.broker.readInbox(jobId);
+	}
+
+	/** Answer a pending ask_main request (exact correlation; rejects duplicates/expired/cross-job). */
+	reply(jobId: string, requestId: string, answer: string): void {
+		this.broker.reply(jobId, requestId, answer);
+	}
+
+	/** Subscribe to NEW worker attention (unconsumed messages + ask_main requests). */
+	onAttention(listener: (attention: AttentionItem) => void): () => void {
+		return this.broker.onAttention(listener);
+	}
+
+	/** Register the human-question seam for worker-routed ask_user_question. */
+	setHumanQuestionHandler(handler: HumanQuestionHandler | undefined): void {
+		this.broker.setHumanQuestionHandler(handler);
+	}
+
+	/** A worker is live for this job (spawned child not yet exited). */
+	hasLiveWorker(jobId: string): boolean {
+		return this.broker.hasActiveChild(jobId);
+	}
+
 	// ── Running ──────────────────────────────────────────────────────────────
 
 	/** Follow-up: resume the job's latest attempt session (cheapest channel). */
 	async followupJob(jobId: string, message: string, agents: AgentConfig[], signal?: AbortSignal): Promise<RunReport> {
+		// Guard BEFORE any crash-recovery read: a live worker must never be
+		// falsely marked interrupted by recoverInterrupted().
+		this.assertNoLiveWorker(jobId, "follow-up");
 		const job = this.requireJob(jobId);
 		const lastAttempt = job.latestAttemptId ? this.store.readAttempt(jobId, job.latestAttemptId) : null;
 		if (!lastAttempt) throw new OrchestratorError("unknown", `Job ${jobId} has no attempts to follow up`);
@@ -316,6 +374,8 @@ export class Orchestrator {
 		agents: AgentConfig[],
 		opts: { strategy?: "resume" | "fresh"; model?: string; reason?: string; signal?: AbortSignal } = {},
 	): Promise<RunReport> {
+		// Guard BEFORE any crash-recovery read (see followupJob).
+		this.assertNoLiveWorker(jobId, "retry");
 		const job = this.requireJob(jobId);
 		if (job.status === "running") throw new OrchestratorError("unknown", `Job ${jobId} is running; cancel or wait first`);
 		job.status = "ready";
@@ -498,6 +558,17 @@ export class Orchestrator {
 		return job;
 	}
 
+	/** Guard against concurrent attempts while an existing child is active:
+	 * live messaging (jobs message/reply) is the supported channel instead. */
+	private assertNoLiveWorker(jobId: string, action: string): void {
+		if (!this.broker.hasActiveChild(jobId)) return;
+		const child = this.broker.activeChild(jobId);
+		throw new OrchestratorError(
+			"unknown",
+			`Job ${jobId} already has a live worker${child ? ` (attempt ${child.attemptId})` : ""}; use jobs message/reply to interact with it instead of ${action} while it runs`,
+		);
+	}
+
 	/** Full ladder loop: attempts until success / exhaustion / budget / cancel. */
 	private async runJobInternal(
 		job: JobRecord,
@@ -505,6 +576,7 @@ export class Orchestrator {
 		opts: { explicitModel?: string; explicitStrategy?: "resume" | "fresh"; escalationReason?: string; signal?: AbortSignal; maxAttemptsThisRun?: number } = {},
 	): Promise<RunReport> {
 		const agent = this.agentByName(agents, job.agent);
+		this.assertNoLiveWorker(job.jobId, "a new run");
 		const attemptsSoFar = this.store.listAttempts(job.jobId);
 		// Automatic runs are capped by the job's lifetime maxAttempts; explicit
 		// manual retries get their own bounded run budget (the caller decides).
@@ -547,7 +619,8 @@ export class Orchestrator {
 			const last = report.attempts[report.attempts.length - 1];
 			if (report.status === "success") break;
 			if (last?.exitReason === "aborted") {
-				this.failJob(job, "aborted");
+				// jobs cancel / user abort: the gated run already persisted the
+				// CANCELLED attempt and job state — never overwrite it with failed.
 				break;
 			}
 			if (last?.exitReason === "budget_exceeded") {
@@ -631,6 +704,29 @@ export class Orchestrator {
 	}
 
 	private async runAttemptGated(
+		job: JobRecord,
+		agent: AgentConfig,
+		decision: RoutingDecision,
+		attemptNumber: number,
+		previousAttempts: AttemptRecord[],
+		opts: { resumeAttempt?: AttemptRecord; taskOverride?: string; escalationReason?: string; manual?: boolean; signal?: AbortSignal },
+	): Promise<RunReport> {
+		const store = this.store;
+		// Cancel ownership: every in-flight attempt registers an AbortController so
+		// jobs cancel (and session teardown) can abort the live worker, whether
+		// the run is awaited by a tool or continuing in the background after a
+		// messaging yield. The tool's own signal is combined in below.
+		const cancelController = new AbortController();
+		this.cancels.set(job.jobId, cancelController);
+		const runSignal = combineSignals(cancelController.signal, opts.signal);
+		try {
+			return await this.runAttemptGatedInner(job, agent, decision, attemptNumber, previousAttempts, { ...opts, signal: runSignal });
+		} finally {
+			if (this.cancels.get(job.jobId) === cancelController) this.cancels.delete(job.jobId);
+		}
+	}
+
+	private async runAttemptGatedInner(
 		job: JobRecord,
 		agent: AgentConfig,
 		decision: RoutingDecision,
@@ -743,7 +839,7 @@ export class Orchestrator {
 		const legUsage: UsageInfo = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, contextTokens: 0, turns: 0 };
 		for (let t = 0; ; t++) {
 			this.events.append(job.jobId, "provider.requested", { provider: decision.resolved.concrete.provider, model: decision.resolved.concrete.model }, attemptId);
-			const spawnReq = {
+			const spawnReq: SpawnRequest = {
 				agent,
 				resolved: decision.resolved,
 				prompt: envelope,
@@ -758,6 +854,15 @@ export class Orchestrator {
 				signal: opts.signal,
 				launchArgs: launch.args,
 				launchEnv: launch.env,
+				// Live messaging hooks (phase 2 broker): worker messages, blocking
+				// requests, and the steering control are broker-owned. Hook-driven
+				// work is asynchronous and never blocks the stdout event loop.
+				onMessage: (message) => this.broker.handleWorkerMessage(job.jobId, attemptId, message),
+				onRequest: (request, rpc) => this.broker.handleWorkerRequest(job.jobId, attemptId, agent.name, request, rpc),
+				onControl: (control) => {
+					if (control) this.broker.attachChild(job.jobId, attemptId, control);
+					else this.broker.detachChild(job.jobId, attemptId);
+				},
 			};
 			outcome = this.config.workerRunner
 				? await this.config.workerRunner(spawnReq)

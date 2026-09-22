@@ -118,7 +118,15 @@ describe("orchestratorPrompt — structured plan contract", () => {
 	});
 
 	it("adds plan to the jobs tool surface", () => {
-		assert.match(prompt, /^- jobs: list \| status.*\| plan$/m);
+		assert.match(prompt, /^- jobs: list \| status.*\| plan \| inbox \| message \| reply$/m);
+	});
+
+	it("documents the live worker messaging surface (phase 2)", () => {
+		assert.match(prompt, /## Live worker messaging \(while jobs run\)/);
+		assert.match(prompt, /jobs action=reply jobId=<job> requestId=<id> answer="\.\.\."/);
+		assert.match(prompt, /return EARLY with the\s+running jobIds and pending requestIds/i);
+		assert.match(prompt, /jobs action=message jobId=<job>/);
+		assert.match(prompt, /Headless sessions report\s+ask_user_question as unavailable/i);
 	});
 });
 

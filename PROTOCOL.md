@@ -52,15 +52,24 @@ experiments with no agent changes.
 Each attempt spawns an isolated pi subprocess (built in `core/spawn.ts`):
 
 ```
-pi --mode json -p
+pi --mode rpc
    --session-dir <attempt>/session --session-id <jobId>-<attemptId>
    --model <resolved provider/model> [--thinking effort]
-   [--tools capabilities] [--no-context-files] [--no-skills]
+   [--tools capabilities,+message_main,+ask_main,+ask_user_question]
+   [--no-context-files] [--no-skills]
    --append-system-prompt <attempt>/SYSTEM.md      # AGENT.md body
-   -e core/worker.ts [-e agent hooks...]           # dedicated hooks
+   -e worker.ts [-e agent hooks...]                # dedicated hooks
    --no-extensions                                  # no recursion/lockdown leakage
-   "<rendered job envelope>"
+   # the rendered job envelope travels as a stdin `prompt` command (never argv);
+   # genuine completion is the agent_settled event, after which stdin closes
+   # gracefully so RPC mode flushes its final output
 ```
+
+- RPC mode also carries live messaging: worker `notify`/`input` dialogs are
+  the transport for message_main / ask_main / ask_user_question, answered by
+  the parent broker over correlated `extension_ui_response` records; the
+  control handle steers a live worker (`jobs action=message`). No tmux, no
+  sockets, no mailboxes (§13).
 
 - Sanitized child env (§30): PATH/HOME/proxies + needed provider keys + agent
   `env` + `PI_ORCHESTRATOR_*` (JOB_ID, ATTEMPT_DIR, ARTIFACTS, RESULT_PATH,
@@ -160,10 +169,11 @@ automatically. Non-git dirs degrade to `cwd`.
 
 ## 9. Main-agent lockdown (§8)
 
-With a `role: main` agent present: active tools = `delegate` + `jobs` only,
-hard `tool_call` block on everything else, orchestrator prompt + roster +
-alias registry injected each turn. The main agent reasons, decomposes,
-delegates, inspects summaries, retries/escalates — it cannot implement.
+With a `role: main` agent present: active tools = `delegate` + `jobs` +
+`ask_user_question` only, hard `tool_call` block on everything else,
+orchestrator prompt + roster + alias registry injected each turn. The main
+agent reasons, decomposes, delegates, inspects summaries, retries/escalates —
+it cannot implement (it can only ask the human user questions).
 
 ## 10. Metrics (§21)
 
@@ -197,3 +207,40 @@ readAttempt, readResult, readArtifact, runJob, runGraph, followupJob, retryJob,
 cancelJob, graph, waitJobs, events — the same primitives the pi tools use;
 future web/mobile/CI interfaces reuse them directly. Worker execution is an
 injectable seam (`config.workerRunner`) used by the deterministic test suite.
+
+## 13. Live agent messaging (phase 2, no tmux)
+
+Workers run in RPC mode, so live messaging rides pi's native extension-UI
+subprotocol — the parent broker (`core/broker.ts`) owns correlation and
+lifecycle; nothing here spawns shells or multiplexers:
+
+- **Wire protocol** (`core/messaging.ts`): versioned, bounded envelopes
+  (`PI-ORCH-MSG:v1:`) for one-way messages (`message_main`) and blocking requests
+  (`ask_main`, `ask_user_question`; 2..8 options, optional descriptions,
+  `allowCustom`, `timeoutSeconds` 1..900 default 300). Replies are explicit:
+  `answered | cancelled | timeout | unavailable | error` — never a fabricated
+  answer.
+- **Parent broker**: live controls keyed by `jobId+attemptId`; pending requests
+  keyed by `jobId+attemptId+rpc.id`, settled EXACTLY ONCE. Messages and request
+  lifecycle are durable events in `events.jsonl`; the bounded inbox keeps the
+  latest 100 items per job. Per-request deadlines are parent-enforced: the
+  pending UI is aborted and settled `timeout` when the deadline fires; worker
+  exit settles `cancelled`. Requests from an old process are stale forever —
+  late replies reject as unknown/expired.
+- **Deadlock-free attention**: `delegate` and `jobs wait` return EARLY with the
+  running jobIds and pending requestIds when a worker messages or asks; the
+  actual run promise continues, tracked in the background (single flight per
+  job; `jobs cancel` and session shutdown own its lifecycle). Later attention
+  and background completions reach the main model via deduplicated
+  `pi.sendMessage` typed custom messages. The main agent answers with
+  `jobs action=reply jobId=<job> requestId=<id> answer="..."`; `jobs
+  action=message` steers a live worker (delivery claimed only on steer ACK);
+  `jobs action=inbox` lists messages + pending requests. Concurrent runs,
+  retries, and follow-ups are rejected while a job's worker is live.
+- **User questions**: `ask_user_question` renders ONE interactive popup in the
+  main session (options + descriptions, up/down + Enter, typed custom answer,
+  Escape cancel, FIFO queue, deadlines honoured even while queued). The same
+  component is the main agent's own `ask_user_question` tool, active under
+  main lockdown. Headless/no-UI sessions return `unavailable` immediately.
+- Job status stays `running` while a worker waits; DAG dependents await the
+  actual result.
