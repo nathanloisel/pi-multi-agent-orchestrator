@@ -709,6 +709,184 @@ describe("DAG scheduling (§11)", () => {
 	});
 });
 
+describe("incremental DAG scheduling (continuous ready-set)", () => {
+	/** Poll until cond is true (deterministic deferred-promise coordination). */
+	async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
+		const deadline = Date.now() + ms;
+		while (!cond()) {
+			if (Date.now() > deadline) throw new Error("waitFor timed out");
+			await new Promise((r) => setTimeout(r, 10));
+		}
+	}
+
+	/** Reject if the promise does not settle in time (hang detector). */
+	function within<T>(promise: Promise<T>, ms = 3000): Promise<T> {
+		let timer: NodeJS.Timeout | undefined;
+		return Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+			}),
+		]).finally(() => clearTimeout(timer));
+	}
+
+	it("fast predecessor releases its dependent while an unrelated slow job is still in flight", async () => {
+		const h = makeHarness();
+		const writer = writingWorker((_dir, jobId) => outcome(successResult(`done ${jobId}`)));
+		let releaseB!: () => void;
+		const gateB = new Promise<void>((r) => {
+			releaseB = r;
+		});
+		h.setWorker(async (req) => {
+			if (req.jobId === "job-b") await gateB; // unrelated slow sibling
+			return writer(req);
+		});
+		const a = h.orch.createJob({ agent: "worker", task: "A: fast", jobId: "job-a" }, h.agents);
+		const b = h.orch.createJob({ agent: "worker", task: "B: slow unrelated", jobId: "job-b" }, h.agents);
+		const c = h.orch.createJob({ agent: "worker", task: "C: depends on A only", jobId: "job-c", dependsOn: ["job-a"] }, h.agents);
+
+		const run = h.orch.runGraph(h.agents, { jobIds: [a.jobId, b.jobId, c.jobId] });
+		// C's worker must be called while B is STILL gated — no whole-wave barrier.
+		await waitFor(() => h.workerCalls.some((call) => call.jobId === "job-c"), 2000);
+		assert.equal(h.orch.readJob("job-a")!.status, "success", "A released C");
+		assert.equal(h.orch.readJob("job-b")!.status, "running", "unrelated slow B must still be running");
+		for (const id of ["job-a", "job-b", "job-c"]) {
+			assert.equal(h.workerCalls.filter((call) => call.jobId === id).length, 1, `${id} must launch exactly once`);
+		}
+		releaseB();
+		const reports = await within(run);
+		assert.equal(reports.length, 3);
+		assert.ok(reports.every((r) => r.status === "success"));
+		assert.equal(h.workerCalls.filter((call) => call.jobId === "job-b").length, 1);
+		h.cleanup();
+	});
+
+	it("ready-set re-evaluation never exceeds the global concurrency cap", async () => {
+		const h = makeHarness({ concurrency: { global: 2, byModel: {} } });
+		const writer = writingWorker((_dir, jobId) => outcome(successResult(`done ${jobId}`)));
+		let active = 0;
+		let maxActive = 0;
+		h.setWorker(async (req) => {
+			active++;
+			maxActive = Math.max(maxActive, active);
+			await new Promise((r) => setTimeout(r, 20));
+			active--;
+			return writer(req);
+		});
+		for (let i = 0; i < 6; i++) h.orch.createJob({ agent: "worker", task: `job ${i}`, jobId: `cap-${i}` }, h.agents);
+		const reports = await within(h.orch.runGraph(h.agents));
+		assert.equal(reports.length, 6);
+		assert.ok(reports.every((r) => r.status === "success"));
+		assert.ok(maxActive <= 2, `global cap violated: ${maxActive} concurrent workers`);
+		assert.equal(h.workerCalls.length, 6, "each job launches exactly once");
+		h.cleanup();
+	});
+
+	it("failure blocks dependents while independent in-flight work proceeds", async () => {
+		const h = makeHarness({ agents: [makeAgent({ name: "worker", retry: { maxAttempts: 1, ladder: [] } })] });
+		const writer = writingWorker((_dir, jobId) =>
+			jobId === "job-f" ? outcome({ ...successResult("cannot"), status: "failure", blockers: ["boom"] }) : outcome(successResult(`done ${jobId}`)),
+		);
+		let releaseF!: () => void;
+		let releaseI!: () => void;
+		const gateF = new Promise<void>((r) => {
+			releaseF = r;
+		});
+		const gateI = new Promise<void>((r) => {
+			releaseI = r;
+		});
+		h.setWorker(async (req) => {
+			if (req.jobId === "job-f") await gateF;
+			if (req.jobId === "job-i") await gateI;
+			return writer(req);
+		});
+		const f = h.orch.createJob({ agent: "worker", task: "F will fail", jobId: "job-f" }, h.agents);
+		const i = h.orch.createJob({ agent: "worker", task: "I independent", jobId: "job-i" }, h.agents);
+		const d = h.orch.createJob({ agent: "worker", task: "D depends on F", jobId: "job-d", dependsOn: ["job-f"] }, h.agents);
+		const updates: string[] = [];
+		const run = h.orch.runGraph(h.agents, {
+			jobIds: [f.jobId, i.jobId, d.jobId],
+			onJobUpdate: (r) => updates.push(`${r.jobId}:${r.status}`),
+		});
+		await waitFor(() => h.workerCalls.some((c) => c.jobId === "job-f") && h.workerCalls.some((c) => c.jobId === "job-i"));
+		releaseF();
+		// D must converge to failed while independent job I is STILL in flight.
+		await waitFor(() => h.orch.readJob("job-d")!.status === "failed", 2000);
+		assert.equal(h.orch.readJob("job-i")!.status, "running", "independent work must still be running");
+		assert.ok(!h.workerCalls.some((c) => c.jobId === "job-d"), "blocked dependent must never spawn a worker");
+		assert.ok(updates.includes("job-f:failed"));
+		assert.ok(updates.includes("job-d:failed"), "dependency-gated failure must reach onJobUpdate");
+		releaseI();
+		const reports = await within(run);
+		assert.ok(reports.some((r) => r.jobId === "job-i" && r.status === "success"), "independent job succeeds");
+		assert.ok(!reports.some((r) => r.jobId === "job-d"), "blocked dependent never produces a report");
+		assert.equal(h.workerCalls.filter((c) => c.jobId === "job-d").length, 0);
+		h.cleanup();
+	});
+
+	it("enqueues each eligible job exactly once even when re-evaluated while queued at a gate", async () => {
+		const h = makeHarness({ concurrency: { global: 4, byModel: { "worker-cheap": 1, "worker-best": 1 } } });
+		const writer = writingWorker((_dir, jobId) => outcome(successResult(`done ${jobId}`)));
+		let releaseX!: () => void;
+		const gateX = new Promise<void>((r) => {
+			releaseX = r;
+		});
+		h.setWorker(async (req) => {
+			if (req.jobId === "job-x") await gateX;
+			return writer(req);
+		});
+		const x = h.orch.createJob({ agent: "worker", task: "X holds the only cheap slot", jobId: "job-x" }, h.agents);
+		const z = h.orch.createJob({ agent: "worker", task: "Z fast unblocker", jobId: "job-z", model: "worker-best" }, h.agents);
+		// A becomes ready only after Z, then queues behind X at the worker-cheap
+		// gate — so its status stays non-terminal while the ready set is re-evaluated.
+		const a = h.orch.createJob({ agent: "worker", task: "A queues behind X", jobId: "job-a", dependsOn: ["job-z"] }, h.agents);
+
+		const run = h.orch.runGraph(h.agents, { jobIds: [x.jobId, z.jobId, a.jobId] });
+		await waitFor(() => h.orch.readJob("job-z")!.status === "success", 2000);
+		await waitFor(() => (h.orch.config.concurrency.stats()["worker-cheap"]?.pending ?? 0) >= 1, 2000);
+		assert.equal(h.orch.readJob("job-a")!.status, "blocked", "A is waiting at the gate, not running");
+		assert.equal(h.orch.config.concurrency.stats()["worker-cheap"].pending, 1, "A must be enqueued exactly once");
+		assert.equal(h.workerCalls.filter((c) => c.jobId === "job-a").length, 0, "A cannot start while X holds the only cheap slot");
+		// extra ready-set re-evaluations must not duplicate the enqueue
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(h.orch.config.concurrency.stats()["worker-cheap"].pending, 1, "no duplicate enqueue on re-evaluation");
+		assert.equal(h.workerCalls.filter((c) => c.jobId === "job-a").length, 0);
+
+		releaseX();
+		const reports = await within(run);
+		assert.equal(reports.length, 3, "one report per job — no duplicate runs");
+		assert.ok(reports.every((r) => r.status === "success"));
+		for (const id of ["job-x", "job-z", "job-a"]) {
+			assert.equal(h.workerCalls.filter((c) => c.jobId === id).length, 1, `${id} must run exactly once`);
+		}
+		h.cleanup();
+	});
+
+	it("cancellation drains in-flight work, launches nothing new, and returns without hanging", async () => {
+		const h = makeHarness();
+		const writer = writingWorker((_dir, jobId) => outcome(successResult(`done ${jobId}`)));
+		h.setWorker(async (req) => {
+			if (req.jobId === "job-a") {
+				// settle only when the run is cancelled — the drain must still finish
+				await new Promise<void>((resolve) => req.signal?.addEventListener("abort", () => resolve(), { once: true }));
+			}
+			return writer(req);
+		});
+		const a = h.orch.createJob({ agent: "worker", task: "A in flight", jobId: "job-a" }, h.agents);
+		const d = h.orch.createJob({ agent: "worker", task: "D after A", jobId: "job-d", dependsOn: ["job-a"] }, h.agents);
+		const ac = new AbortController();
+		const run = h.orch.runGraph(h.agents, { signal: ac.signal, jobIds: [a.jobId, d.jobId] });
+		await waitFor(() => h.workerCalls.some((c) => c.jobId === "job-a"), 2000);
+		ac.abort();
+		const reports = await within(run, 3000); // would reject on a hang
+		assert.equal(h.workerCalls.filter((c) => c.jobId === "job-a").length, 1);
+		assert.equal(h.workerCalls.filter((c) => c.jobId === "job-d").length, 0, "no new jobs may launch after cancellation");
+		assert.ok(reports.some((r) => r.jobId === "job-a"), "in-flight job drained into reports");
+		assert.equal(h.orch.readJob("job-d")!.status, "blocked", "dependent never ran");
+		h.cleanup();
+	});
+});
+
 describe("agent config (§7)", () => {
 	it("agent runtime.model is a logical alias resolved by the registry", async () => {
 		const agent = makeAgent({ name: "worker", runtime: { model: "worker-best", effort: "high" } });

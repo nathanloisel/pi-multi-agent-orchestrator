@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import { parse as yamlParse } from "yaml";
 import { discoverAgents, orchestratorRoot, type AgentConfig } from "./discovery.ts";
 import { rosterText, orchestratorPrompt } from "./core/prompts.ts";
+import { listMailboxMessages, MAILBOX_DEFAULT_READ_LIMIT } from "./core/mailbox.ts";
 import { ModelRegistry } from "./core/models.ts";
 import { Router, type RoutingRule } from "./core/routing.ts";
 import { JobStore, readJson } from "./core/storage.ts";
@@ -767,7 +768,7 @@ export default function (pi: ExtensionAPI) {
 			"Use delegate for ALL work requiring file access, commands, search, images, or code changes — the orchestrator has no direct tools.",
 			"You own synthesis, diagnosis, and design; use delegate for bounded work — workers collect facts or implement decided changes, not open-ended architecture.",
 			"Write delegate tasks for a focused cheap model with zero conversation context: objective, exact targets, chosen approach/steps, boundaries/non-goals, expected cases, and the validation command.",
-			"Use delegate with the fewest coherent jobs: keep related changes and their specified tests together, batch only independent jobs with dependsOn, and never create one job per file or command.",
+			"Slice work into the smallest independently verifiable outcomes that justify coordination overhead; declare write ownership, prerequisites, acceptance checks, and integration responsibility, and batch independent jobs with explicit dependencies.",
 			"Use delegate followup for related bounded corrections; let the automatic retry ladder handle execution errors and replan a bad specification instead of retrying it.",
 		],
 		parameters: Type.Object({
@@ -955,19 +956,20 @@ export default function (pi: ExtensionAPI) {
 		name: "jobs",
 		label: "Jobs",
 		description:
-			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> (yields early when a worker messages or asks) | inbox [jobId] (live messages + pending requests) | message <jobId,message> (steer a LIVE worker; delivered only on ACK) | reply <jobId,requestId,answer> (answer a pending ask_main) | plan steps=[...] (publish/revise the structured plan) | metrics.",
-		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/followup/retry/cancel/wait/inbox/message/reply/plan/metrics",
+			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | messages <jobId> (read-only listing of stored mailbox messages; never consumes them) | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> (yields early when a worker messages or asks) | inbox [jobId] (live messages + pending requests) | message <jobId,message> (steer a LIVE worker; delivered only on ACK) | reply <jobId,requestId,answer> (answer a pending ask_main) | plan steps=[...] (publish/revise the structured plan) | metrics.",
+		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/messages/followup/retry/cancel/wait/inbox/message/reply/plan/metrics",
 		promptGuidelines: [
 			"Publish the structured plan with jobs action=plan BEFORE delegating for any multi-step task; each step needs a stable id and a clear human-readable title, and the step id should equal the delegate job alias id (delegate id=...) so the workspace can bind them.",
 			"Omit unchanged steps when revising a plan — they are retained; only real changes need a new revision, and statuses advance planned → running → completed/failed/blocked/cancelled/superseded.",
 			"Use jobs.followup for small corrections (resumes the worker's session); use jobs.retry strategy=fresh when the worker is stuck, optionally escalating model (worker-best, frontier).",
 			"Use jobs.read and jobs.artifact to pull details on demand — never request full logs into context.",
+			"Use jobs.messages <jobId> to inspect a job's stored peer mailbox read-only (bounded listing); workers consume their own inbox via the mailbox_read tool.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(
-				["list", "status", "read", "artifact", "graph", "events", "attempts", "followup", "retry", "cancel", "wait", "inbox", "message", "reply", "plan", "metrics"] as const,
+				["list", "status", "read", "artifact", "graph", "events", "attempts", "messages", "followup", "retry", "cancel", "wait", "inbox", "message", "reply", "plan", "metrics"] as const,
 			),
-			jobId: Type.Optional(Type.String()),
+			jobId: Type.Optional(Type.String({ description: "target job id (required for status/read/artifact/events/attempts/messages/followup/retry/cancel/wait)" })),
 			path: Type.Optional(Type.String({ description: "artifact relative path (action: artifact)" })),
 			attemptId: Type.Optional(Type.String()),
 			message: Type.Optional(Type.String({ description: "follow-up instruction (action: followup)" })),
@@ -1107,6 +1109,18 @@ export default function (pi: ExtensionAPI) {
 								.map((a) => `- ${a.attemptId} [${a.logicalModel ?? "?"}→${a.resolvedModel ?? "?"}] ${a.retryMode} ${a.status}${a.exitReason ? ` (${a.exitReason})` : ""} ${a.usage ? `$${a.usage.costUsd.toFixed(4)} ${a.usage.turns}t ${((a.latencyMs ?? 0) / 1000).toFixed(0)}s` : ""}`)
 								.join("\n") || "(no attempts)",
 						);
+					}
+					case "messages": {
+						if (!params.jobId) return needsId();
+						// Read-only listing: listMailboxMessages never acknowledges and
+						// never creates files, so inspection cannot consume the queue.
+						const messages = await listMailboxMessages(root, params.jobId, { limit: MAILBOX_DEFAULT_READ_LIMIT });
+						if (messages.length === 0) return t(`No stored mailbox messages for ${params.jobId}.`);
+						const lines = messages.map((m) => {
+							const body = m.body.replace(/\s+/g, " ");
+							return `- ${m.createdAt} from ${m.fromJobId}/${m.fromAttemptId} [${m.id.slice(0, 8)}]: ${body.slice(0, 400)}${body.length > 400 ? " …" : ""}`;
+						});
+						return t(cap(`Stored mailbox messages for ${params.jobId} (${messages.length}, read-only — not consumed):\n${lines.join("\n")}`));
 					}
 					case "followup": {
 						if (!params.jobId || !params.message) return t("jobId and message are required.");

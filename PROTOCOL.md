@@ -163,13 +163,48 @@ failed | waiting | cancelled | interrupted.
 - Budgets: per-attempt/per-job/daily USD ceilings + maxTurns/maxOutputTokens/
   timeout; violations are machine-readable (`budget exceeded: perJobUsd:2`).
 
-## 7. DAG & concurrency
+## 7. DAG & incremental scheduling
 
-`delegate {jobs:[{id, dependsOn:[...]}]}` creates a batch; the scheduler runs
-ready jobs concurrently (global + per-alias gates), propagates dependency
-failures downstream without running blocked jobs, detects cycles, and expands
-scoped runs to transitive dependencies. `jobs.graph` shows effective states
-without injecting results into context.
+`delegate {jobs:[{id, dependsOn:[...]}]}` creates a batch; scheduling is
+**incremental**: each job starts as soon as its own declared prerequisites
+have succeeded — there is no batch-wide barrier — under global and per-alias
+gates, propagating dependency failures downstream without running blocked
+jobs, detecting cycles, and expanding scoped runs to transitive dependencies.
+The DAG is orchestrator-owned: workers never add, remove, or reorder edges,
+and they never retry on their own. Slicing guidance (frontier prompt):
+outcomes must be independently verifiable, a split is justified only by the
+parallel gain versus the startup/context/coordination cost of another job,
+and tightly coupled implementation plus its tests stays in one job.
+`jobs.graph` shows effective states without injecting results into context.
+
+## 7a. Peer communication: checkpoint mailbox
+
+Workers get exactly two public mailbox tools: `mailbox_send(toJobId, body)`
+persists a short, bounded message for a specific peer job, and
+`mailbox_read()` returns the worker's own persisted, bounded inbox. Delivery
+is by **checkpoint**: pending messages are handed over when a worker
+checkpoints, and messages received during a run are injected into context
+marked **untrusted peer evidence** — claims from a peer job, never
+instructions or verified truth. Messages carry only concrete blockers,
+interface questions, and discoveries a peer needs; the orchestrator supplies
+the relevant peer job IDs and their roles in each job's task context and
+observes all traffic with `jobs action=messages <jobId>`. Sending never wakes
+or unblocks a finished worker — it only persists for checkpoint delivery.
+Dependency handoffs and mailbox traffic are **evidence only**: integration of
+changed code across isolated worktrees remains an explicit responsibility
+(named handoff/merge owner) followed by one final end-to-end validation.
+
+Delivery is **bounded at-least-once**, never exactly-once: checkpoint
+delivery writes a durable per-message receipt only after the enqueue
+succeeded, so a crash in between can re-deliver a batch — a possible
+duplicate is preferred over message loss. Bounds: 4096 UTF-8 bytes per
+message, 8 messages read per batch (32 max), 16 KiB of bodies per batch,
+at most 3 automatic mailbox-only continuations per worker run. The manual
+`mailbox_read()` tool has normal consuming tool-read semantics: it
+acknowledges exactly the batch it returns when the tool executes (like
+reading a queue) — it is not an exactly-once handoff to the model.
+`jobs action=messages` is read-only inspection and never consumes the
+queue.
 
 ## 8. Workspaces (§14)
 

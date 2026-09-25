@@ -310,9 +310,9 @@ function makeWorkerCtx(overrides: {
 }
 
 describe("worker messaging tools", () => {
-	it("registers the three messaging tools only for orchestrator sub agents", () => {
+	it("registers the messaging and mailbox tools only for orchestrator sub agents", () => {
 		const sub = loadWorkerPi({ PI_ORCHESTRATOR_SUBAGENT: "1", PI_ORCHESTRATOR_ALLOWED_TOOLS: "read" });
-		assert.deepEqual([...sub.tools.keys()].sort(), ["ask_main", "ask_user_question", "message_main"]);
+		assert.deepEqual([...sub.tools.keys()].sort(), ["ask_main", "ask_user_question", "mailbox_read", "mailbox_send", "message_main"]);
 
 		const main = loadWorkerPi({ PI_ORCHESTRATOR_SUBAGENT: undefined });
 		assert.equal(main.tools.size, 0);
@@ -328,7 +328,7 @@ describe("worker messaging tools", () => {
 		);
 		const sessionStart = worker.handlers.get("session_start")!;
 		await sessionStart({ type: "session_start" }, makeWorkerCtx().ctx);
-		assert.deepEqual(worker.active().sort(), ["ask_main", "ask_user_question", "message_main", "read"]);
+		assert.deepEqual(worker.active().sort(), ["ask_main", "ask_user_question", "mailbox_read", "mailbox_send", "message_main", "read"]);
 	});
 
 	it("allows messaging tool calls while enforcing the role allowlist and recursion block", async () => {
@@ -340,6 +340,9 @@ describe("worker messaging tools", () => {
 		assert.equal(await toolCall({ toolName: "ask_main", toolCallId: "c2", input: {} }, ctx), undefined);
 		assert.equal(await toolCall({ toolName: "ask_user_question", toolCallId: "c3", input: {} }, ctx), undefined);
 		assert.equal(await toolCall({ toolName: "read", toolCallId: "c4", input: {} }, ctx), undefined);
+		// coexisting checkpoint mailbox tools pass the guard alongside live messaging
+		assert.equal(await toolCall({ toolName: "mailbox_send", toolCallId: "c6", input: {} }, ctx), undefined);
+		assert.equal(await toolCall({ toolName: "mailbox_read", toolCallId: "c7", input: {} }, ctx), undefined);
 
 		const blockedBash = (await toolCall({ toolName: "bash", toolCallId: "c5", input: {} }, ctx)) as { block: boolean; reason: string };
 		assert.equal(blockedBash.block, true);

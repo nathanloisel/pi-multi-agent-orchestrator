@@ -406,12 +406,45 @@ export class Orchestrator {
 	 * satisfied; independent jobs execute concurrently under the concurrency
 	 * gates. Failed/cancelled dependencies propagate "failed" downstream.
 	 *
-	 * onJobUpdate fires once per job as it settles — even inside a parallel
-	 * batch — so callers can stream partial tool results. Observer exceptions
-	 * are isolated and never affect job outcomes.
+	 * Incremental scheduling: the ready set is re-evaluated after EVERY job
+	 * completion instead of waiting for a whole ready wave (Promise.allSettled)
+	 * to drain. Each eligible job is enqueued exactly once (`launched`), so a
+	 * fast predecessor releases its dependents while unrelated slow jobs are
+	 * still in flight, and outstanding work is always drained before returning.
+	 * Admission is bounded by the global concurrency limit: jobs beyond that
+	 * wait for a completion (which triggers a ready-set re-evaluation anyway),
+	 * while the per-model attempt gates keep applying inside executeAttempt.
+	 *
+	 * onJobUpdate fires once per job as it settles — even while other jobs are
+	 * still running — so callers can stream partial tool results. Observer
+	 * exceptions are isolated and never affect job outcomes.
 	 */
 	async runGraph(agents: AgentConfig[], opts: { signal?: AbortSignal; jobIds?: string[]; onJobUpdate?: (report: RunReport) => void } = {}): Promise<RunReport[]> {
+		type Settled = { jobId: string; report?: RunReport; error?: unknown };
 		const reports: RunReport[] = [];
+		// Jobs already handed to runJobInternal exactly once — the ready set may be
+		// re-evaluated many times while a job is still queued at a concurrency gate
+		// (its status stays "ready"), and it must never be enqueued twice.
+		const launched = new Set<string>();
+		const inFlight = new Map<string, Promise<Settled>>();
+		const notify = (report: RunReport) => {
+			if (!opts.onJobUpdate) return;
+			try {
+				opts.onJobUpdate(report);
+			} catch {
+				/* progress observers must never affect job outcomes */
+			}
+		};
+		/** Await ANY in-flight completion and consume it (report + observer). */
+		const drainOne = async (): Promise<void> => {
+			const settled = await Promise.race(inFlight.values());
+			inFlight.delete(settled.jobId);
+			if (settled.report) {
+				reports.push(settled.report);
+				notify(settled.report);
+			}
+			// rejected entries are dropped, matching Promise.allSettled semantics
+		};
 		for (;;) {
 			const jobs = this.store.listJobs().map((j) => this.store.recoverInterrupted(j));
 			const byId = new Map(jobs.map((j) => [j.jobId, j]));
@@ -448,6 +481,7 @@ export class Orchestrator {
 				// Scoped runs execute only the requested subgraph + transitively
 				// pulled-in dependencies; unscoped runs execute everything ready.
 				if (scope && !scope.has(j.jobId)) return false;
+				if (launched.has(j.jobId)) return false; // enqueue each job exactly once
 				if (statusIsTerminal(j.status) || j.status === "running" || j.status === "interrupted") return false;
 				return effectiveStatus(j, byId) === "ready";
 			});
@@ -474,44 +508,41 @@ export class Orchestrator {
 			}
 			// dependency-gated failures never execute an attempt, but they ARE
 			// transitions: report them so partial results stay truthful.
-			if (opts.onJobUpdate) {
-				for (const j of propagated) {
-					try {
-						opts.onJobUpdate(this.derivedReport(j));
-					} catch {
-						/* progress observers must never affect job outcomes */
-					}
-				}
-			}
-			if (runnable.length === 0) {
-				// nothing to execute; loop only if propagation changed state so its
-				// own downstream effects are resolved (then terminate)
-				if (propagated.length === 0) break;
-				continue;
-			}
+			for (const j of propagated) notify(this.derivedReport(j));
 
-			const batch = await Promise.allSettled(
-				runnable.map(async (job) => {
-					const controller = new AbortController();
-					this.cancels.set(job.jobId, controller);
-					const combined = combineSignals(controller.signal, opts.signal);
-					try {
-						const report = await this.runJobInternal(job, agents, { signal: combined });
-						if (opts.onJobUpdate) {
-							try {
-								opts.onJobUpdate(report);
-							} catch {
-								/* progress observers must never affect job outcomes */
-							}
+			// Propagation is progress (its own downstream effects must be resolved);
+			// launching is progress (new work is outstanding). Otherwise wait for ANY
+			// in-flight completion — or terminate when nothing is outstanding.
+			let progress = propagated.length > 0;
+			// A cancelled run drains what is already in flight but enqueues nothing new.
+			if (runnable.length > 0 && !opts.signal?.aborted) {
+				// Admission control: never hold more jobs in flight than the global
+				// concurrency gate can admit; the rest wait for a completion (the
+				// ready set is re-evaluated then anyway). Per-model gates still apply
+				// per attempt inside executeAttempt.
+				const capacity = Math.max(0, this.config.concurrency.stats().global.limit - inFlight.size);
+				const batch = runnable.slice(0, capacity);
+				for (const job of batch) {
+					launched.add(job.jobId);
+					const run: Promise<Settled> = (async (): Promise<Settled> => {
+						const controller = new AbortController();
+						this.cancels.set(job.jobId, controller);
+						const combined = combineSignals(controller.signal, opts.signal);
+						try {
+							return { jobId: job.jobId, report: await this.runJobInternal(job, agents, { signal: combined }) };
+						} catch (error) {
+							return { jobId: job.jobId, error };
+						} finally {
+							this.cancels.delete(job.jobId);
 						}
-						return report;
-					} finally {
-						this.cancels.delete(job.jobId);
-					}
-				}),
-			);
-			for (const r of batch) {
-				if (r.status === "fulfilled") reports.push(r.value);
+					})();
+					inFlight.set(job.jobId, run);
+				}
+				if (batch.length > 0) progress = true;
+			}
+			if (!progress) {
+				if (inFlight.size === 0) break; // everything settled and nothing ready
+				await drainOne();
 			}
 		}
 		return reports;
