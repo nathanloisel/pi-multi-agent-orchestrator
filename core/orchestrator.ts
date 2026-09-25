@@ -19,7 +19,7 @@ import { MessageBroker, type AttentionItem, type HumanQuestionHandler, type Inbo
 import { EventLog, type EventType } from "./events.ts";
 import { OrchestratorError } from "./errors.ts";
 import { ModelRegistry, type LaunchConfig } from "./models.ts";
-import { renderDependencySection, renderEnvelope, type EnvelopeInput } from "./prompts.ts";
+import { renderDependencySection, renderEnvelope, resultDeliveryFor, type EnvelopeInput } from "./prompts.ts";
 import { extractResult, persistAttemptResult, renderReportMd, resultSummaryForOrchestrator } from "./result.ts";
 import { Router, type RoutingDecision } from "./routing.ts";
 import { runWorker, type SpawnOutcome, type SpawnRequest } from "./spawn.ts";
@@ -141,6 +141,9 @@ export class Orchestrator {
 		this.store = config.store;
 		this.events = config.events;
 		this.broker = new MessageBroker(config.events);
+		// Fires only for provably dead or unrecorded owners: recoverInterrupted()
+		// protects attempts whose ownerPid liveness cannot be disproved, so this
+		// reason stays accurate for every emitted job.interrupted event.
 		this.store.setRecoveryHandler((job, attempt) => {
 			this.events.append(job.jobId, "job.interrupted", { reason: "orchestrator_process_terminated" }, attempt.attemptId);
 		});
@@ -880,7 +883,7 @@ export class Orchestrator {
 		}
 
 		// ── result extraction + deterministic validation (§4, §15)
-		const extracted = extractResult({ attemptDir, finalText: outcome.finalText, jobId: job.jobId, attemptId });
+		const extracted = extractResult({ attemptDir, finalText: outcome.finalText, jobId: job.jobId, attemptId, delivery: resultDeliveryFor(agent) });
 		// Canonical status precedence (§4): a terminal runError is authoritative.
 		// If the transport-retry loop ENDED with a run failure, a worker-written
 		// success result must never surface as canonical success. Findings/changes/

@@ -25,10 +25,77 @@ export interface EnvelopeInput {
 	artifactsDir: string;
 	validationCommands: string[];
 	isFollowUp: boolean;
-	resultPath: string; // where the worker must write result.json
+	resultPath: string; // where write-capable workers must write result.json
 }
 
-export function outputContract(resultPath: string, artifactsDir: string): string {
+/**
+ * How a worker delivers its canonical JobResult:
+ *   - "file"           → write-capable workers write <attempt>/result.json (preferred)
+ *   - "fenced-message" → workers whose tool allowlist has no write tool deliver the
+ *                        same schema-valid result as one fenced ```json block in their
+ *                        final message; core/result.ts extracts it (source "json-block").
+ * No allowlist (undefined/empty capabilities) = full tool surface = write-capable.
+ */
+export type ResultDelivery = "file" | "fenced-message";
+
+export function resultDeliveryFor(agent: Pick<AgentConfig, "capabilities">): ResultDelivery {
+	const caps = agent.capabilities;
+	if (!caps || caps.length === 0) return "file";
+	return caps.some((c) => c === "edit" || c === "write" || c === "create") ? "file" : "fenced-message";
+}
+
+export interface OutputContractInput {
+	resultPath: string;
+	artifactsDir: string;
+	jobId: string;
+	attemptId: string;
+	delivery: ResultDelivery;
+}
+
+export function outputContract(i: OutputContractInput): string {
+	const { resultPath, artifactsDir, jobId, attemptId, delivery } = i;
+	if (delivery === "fenced-message") {
+		return `# OUTPUT CONTRACT
+
+You do NOT have write tools for this job. Deliver your final result IN your
+final chat message as ONE fenced \`\`\`json code block — the orchestrator
+extracts it automatically. Do NOT attempt to write result.json or any other
+file (write attempts will be blocked): no file is required or expected from you.
+
+Schema version: ${RESULT_SCHEMA_VERSION}. Shape (all fields required; empty arrays allowed). Use EXACTLY these identifier values:
+
+{
+  "schemaVersion": ${RESULT_SCHEMA_VERSION},
+  "jobId": "${jobId}",
+  "attemptId": "${attemptId}",
+  "status": "success" | "partial" | "failure" | "blocked",
+  "summary": "<one line: what was accomplished>",
+  "findings": [ { "severity": "info|warning|error", "code": "<SHORT_CODE>", "message": "<fact>", "evidence": "<path:line or command output snippet>" } ],
+  "changes": [],
+  "validation": { "status": "passed|failed|skipped", "checks": [ { "name": "...", "status": "...", "command": "..." } ] },
+  "artifacts": [],
+  "blockers": [ "<only when blocked/failure>" ],
+  "followUps": [ "<suggested next steps>" ],
+  "metrics": {}
+}
+
+Hard rules:
+- Your final message MUST contain exactly one fenced \`\`\`json block holding
+  the complete JSON above; the block must parse as JSON and may be the whole
+  message (optionally preceded by one short status line). Prose without the
+  fenced block — or JSON that does not match this shape — is a failed attempt.
+- "jobId" and "attemptId" MUST be the exact values shown above, and every
+  field in the shape is required (empty arrays allowed).
+- NEVER paste large content (file bodies, logs, diffs, transcripts) into
+  findings or the fenced block — cite evidence as path:line references instead.
+- "changes" stays [] unless you actually changed files with allowed tools;
+  never claim work you did not do or did not verify.
+- Host-side deterministic validation may re-run commands after you finish; your
+  self-reported "validation" does not replace it. Be honest: never claim success
+  you did not verify.
+- Do not include hidden reasoning traces. Only summaries, decisions, findings,
+  evidence, artifacts.`;
+	}
 	return `# OUTPUT CONTRACT
 
 You MUST finish by writing a JSON file to exactly this path, using your file tools:
@@ -111,6 +178,7 @@ export function renderDependencySection(dependencies: DependencyHandoff[], omitt
 export function renderEnvelope(i: EnvelopeInput): string {
 	const sect = (name: string, body: string) => `# ${name}\n\n${body.trim() || "none"}\n`;
 	const list = (items?: string[]) => (items && items.length ? items.map((x) => `- ${x}`).join("\n") : "none");
+	const delivery = resultDeliveryFor(i.agent);
 
 	const filesSection = i.inlinedFiles.length
 		? i.inlinedFiles.map((f) => `## ${f.path}${f.truncated ? " (truncated)" : ""}\n\n\`\`\`\n${f.content}\n\`\`\``).join("\n\n")
@@ -141,7 +209,9 @@ export function renderEnvelope(i: EnvelopeInput): string {
 		i.isFollowUp
 			? sect(
 					"FOLLOW-UP",
-					"This is a FOLLOW-UP message in your existing session. You already have the original task and your prior work in context. Address the new instruction below, update result.json at the path given in OUTPUT CONTRACT, then reply with one short line.",
+					delivery === "file"
+						? "This is a FOLLOW-UP message in your existing session. You already have the original task and your prior work in context. Address the new instruction below, update result.json at the path given in OUTPUT CONTRACT, then reply with one short line."
+						: "This is a FOLLOW-UP message in your existing session. You already have the original task and your prior work in context. Address the new instruction below, then deliver your updated result exactly as OUTPUT CONTRACT specifies (one fenced ```json block in your reply).",
 				)
 			: "",
 		sect("ROLE", i.agent.description || i.agent.name),
@@ -163,14 +233,21 @@ export function renderEnvelope(i: EnvelopeInput): string {
 		sect("CONSTRAINTS", list([...(i.agent.context.mode === "none" ? [] : []), ...(i.constraints ?? []), ...(i.pack.constraints ?? [])])),
 		sect("ACCEPTANCE CRITERIA", list(i.pack.acceptance)),
 		sect("WORKSPACE", `Work in: ${i.workspaceDir}\nAll paths are relative to this directory unless absolute.`),
-		sect("ARTIFACT DIRECTORY", `Write all large outputs (logs, extracted data, generated files) under:\n${i.artifactsDir}`),
+		sect(
+			"ARTIFACT DIRECTORY",
+			delivery === "file"
+				? `Write all large outputs (logs, extracted data, generated files) under:\n${i.artifactsDir}`
+				: `You cannot write files, so keep large outputs out of your reply: cite\nevidence as path:line references in findings instead.`,
+		),
 		sect(
 			"VALIDATION",
 			i.validationCommands.length
 				? `After finishing your changes, run these commands yourself and make them pass:\n${i.validationCommands.map((c) => `- ${c}`).join("\n")}\nThe orchestrator will ALSO run them host-side. Failing validation = failed attempt.`
-				: "No host-side validation configured. Verify your work as appropriate and record what you verified in result.json.",
+				: delivery === "file"
+					? "No host-side validation configured. Verify your work as appropriate and record what you verified in result.json."
+					: "No host-side validation configured. Verify your work as appropriate and record what you verified in your final fenced result.",
 		),
-		sect("OUTPUT CONTRACT", outputContract(i.resultPath, i.artifactsDir).replace("# OUTPUT CONTRACT\n\n", "")),
+		sect("OUTPUT CONTRACT", outputContract({ resultPath: i.resultPath, artifactsDir: i.artifactsDir, jobId: i.jobId, attemptId: i.attemptId, delivery }).replace("# OUTPUT CONTRACT\n\n", "")),
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -219,7 +296,11 @@ ask_user_question as unavailable; timeouts and cancellations are always explicit
 - Workers run on interchangeable backends via logical model aliases (see registry
   below). You never pick concrete provider models; routing decides, and you may
   request a stronger alias (worker-best, frontier) explicitly on retry when justified.
-- Workers finish by writing a validated result.json. You receive only: status,
+- Workers finish with a validated result delivered per the per-attempt OUTPUT
+  CONTRACT injected into their envelope: write-capable agents write result.json;
+  write-restricted agents return one schema-valid fenced \`\`\`json block in their
+  final message. That injected delivery contract takes precedence over any
+  static AGENT.md reference to result.json. You receive only: status,
   summary, validation status, blockers, artifact references, usage. Pull details
   with jobs.read / jobs.artifact ONLY when needed.
 - Failed validation triggers the retry ladder automatically when the job was

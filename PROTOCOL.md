@@ -79,12 +79,23 @@ pi --mode rpc
   / timeout / auth are **transport** errors → in-attempt exponential-backoff
   retries that never consume the task ladder. Task errors → ladder.
 - Timeouts, Esc-abort (SIGTERM→SIGKILL), crash → attempt persisted as
-  `interrupted` and recovered on next load.
+  `interrupted` and recovered on next load. Recovery is owner-aware: an attempt
+  whose `ownerPid` is alive (or whose death cannot be disproved —
+  `process.kill(pid, 0)` success, EPERM, or uncertain errors) is never touched,
+  so any `listJobs`/`readJob` call, from any process, leaves live running jobs
+  alone and emits no `job.interrupted`; only provably dead, invalid, or
+  pre-`ownerPid` orphan records are recovered — idempotently, exactly one
+  `job.interrupted` per recovered attempt.
 
 ## 3. Canonical upstream protocol: result.json (schema v1)
 
-Workers MUST write `<attempt>/result.json` (path given in the envelope's OUTPUT
-CONTRACT and via `PI_ORCHESTRATOR_RESULT_PATH`):
+Write-capable workers MUST write `<attempt>/result.json` (path given in the
+envelope's OUTPUT CONTRACT and via `PI_ORCHESTRATOR_RESULT_PATH`).
+Write-restricted workers (a tool allowlist without `edit`/`write`, e.g. the
+researcher) cannot write files: their OUTPUT CONTRACT instead mandates ONE
+schema-valid fenced ```json block in the final message, carrying the exact
+`jobId`/`attemptId` and every required field. Same schema either way; the
+extraction pipeline below picks up the fenced block when no result.json exists:
 
 ```json
 { "schemaVersion": 1, "jobId": "...", "attemptId": "...",
@@ -197,7 +208,8 @@ No learned router in V1.
 Provider-level retries remain inside one attempt. If they exhaust with
 `provider_unavailable`/`transport_error`, the job enters explicit, inspectable
 `failed` state and no reasoning/model ladder rung is consumed. A process crash leaves a
-running attempt; reload marks it `interrupted`, emits `job.interrupted`, and a
+running attempt; reload marks it `interrupted` (only when its `ownerPid` is dead
+or unrecorded — live owners are protected), emits `job.interrupted`, and a
 fresh retry allocates a new attempt while retaining the interrupted record.
 
 ## 12. Runtime API (§24, UI-independent)

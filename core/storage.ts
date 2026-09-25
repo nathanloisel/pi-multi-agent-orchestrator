@@ -27,7 +27,11 @@
  * directory (atomic on POSIX). Attempt allocation uses mkdir (atomic) so two
  * schedulers can never claim the same attempt number. A crash leaves at worst
  * an attempt.json with status "running" — recoverInterrupted() marks those
- * "interrupted" at load time.
+ * "interrupted" at load time, but only when the attempt's ownerPid (the
+ * orchestrator process that persisted it) is provably gone; attempts owned by
+ * a live process are never touched, so any listJobs()/readJob() call — from
+ * this process or another — preserves live running jobs and emits no
+ * job.interrupted event for them.
  */
 
 import * as fs from "node:fs";
@@ -70,16 +74,26 @@ export function sha256File(file: string): string | undefined {
 // ── Path helpers ────────────────────────────────────────────────────────────
 
 /**
- * True when a process id refers to a live process (0-signal probe).
- * EPERM means the process exists but is not ours (alive); ESRCH means dead.
+ * Owner-liveness probe for orphan recovery. Returns true only when a live
+ * owner must be PROTECTED (attempt left untouched); false means no protectable
+ * live owner exists and legacy orphan recovery may proceed:
+ *   - missing ownerPid       → legacy owner-agnostic recovery (records predating ownerPid)
+ *   - invalid pid value      → unusable owner; rejected WITHOUT probing — kill(0/-n, 0)
+ *                              would signal this process's own group
+ *   - probe success          → alive
+ *   - EPERM                  → exists but not signalable by us → alive/unknown → protected
+ *   - ESRCH                  → definitively dead → recovery allowed
+ *   - any other/uncertain error → conservatively protected (never interrupt on doubt)
  */
-export function isProcessAlive(pid: number | undefined): boolean {
-	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+export function ownerProcessAlive(ownerPid: number | undefined): boolean {
+	if (ownerPid === undefined) return false;
+	if (!Number.isInteger(ownerPid) || ownerPid <= 0) return false; // invalid — never probe
 	try {
-		process.kill(pid, 0);
+		process.kill(ownerPid, 0);
 		return true;
-	} catch (err) {
-		return (err as NodeJS.ErrnoException).code === "EPERM";
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException | undefined)?.code;
+		return code !== "ESRCH"; // EPERM/EACCES/unknown → conservatively alive
 	}
 }
 
@@ -149,7 +163,15 @@ export class JobStore {
 		return jobs.sort((a, b) => b.updatedAt - a.updatedAt);
 	}
 
-	/** Mark attempts left "running" by a crash as interrupted (§29). */
+	/**
+	 * Mark attempts left "running" by a crash as interrupted (§29).
+	 *
+	 * Owner-aware: when the attempt records an ownerPid and that process is
+	 * alive (or its death cannot be disproved), the record is left untouched —
+	 * recovery only runs for provably dead or unusable/missing owners. Once the
+	 * record leaves "running", no further probe or recovery event fires
+	 * (idempotent; exactly one job.interrupted per recovered attempt).
+	 */
 	recoverInterrupted(job: JobRecord): JobRecord {
 		const attempt = job.latestAttemptId ? this.readAttempt(job.jobId, job.latestAttemptId) : null;
 		// Crash recovery is for ORPHANED attempts only. While the owning
@@ -158,7 +180,7 @@ export class JobStore {
 		// pending ask — and reads (readJob/listJobs via jobs status/list/
 		// graph/wait) must NEVER flip it to "interrupted". Missing/dead
 		// owners recover exactly as before (legacy policy).
-		if (attempt && attempt.status === "running" && !isProcessAlive(attempt.ownerPid)) {
+		if (attempt && attempt.status === "running" && !ownerProcessAlive(attempt.ownerPid)) {
 			attempt.status = "interrupted";
 			attempt.exitReason = "crashed";
 			attempt.completedAt = Date.now();

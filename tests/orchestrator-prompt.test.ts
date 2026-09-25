@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { orchestratorPrompt, renderEnvelope } from "../core/prompts.ts";
+import { orchestratorPrompt, renderEnvelope, resultDeliveryFor } from "../core/prompts.ts";
 import type { ContextPack, DependencyHandoff } from "../core/types.ts";
 
 const BASE_OPTS = {
@@ -317,5 +317,68 @@ describe("orchestratorPrompt — envelope untouched by the output-contract chang
 		const env = renderWithPack({ objective: "o", constraints: [], acceptance: [], dependenciesOmitted: 2 } as unknown as ContextPack);
 		assert.match(env, /# DEPENDENCY HANDOFFS/);
 		assert.match(env, /2 prerequisite record\(s\) omitted by handoff bounds/);
+	});
+});
+
+describe("OUTPUT CONTRACT — delivery by write capability", () => {
+	const render = (capabilities: string[] | undefined, over: { isFollowUp?: boolean } = {}): string => {
+		const pack = { background: "b", relevantFiles: [], relevantSymbols: [], acceptance: [], constraints: [] } as unknown as ContextPack;
+		return renderEnvelope({
+			jobId: "job-ro-1",
+			attemptId: "attempt-002",
+			agent: { name: "researcher", description: "reads only", role: "sub", runtime: {}, capabilities, context: { mode: "none" }, workspace: { strategy: "cwd" } } as never,
+			task: "investigate",
+			pack,
+			inlinedFiles: [],
+			workspaceDir: "/ws",
+			attemptDir: "/ws/.attempts/attempt-002",
+			artifactsDir: "/ws/.attempts/attempt-002/artifacts",
+			validationCommands: [],
+			isFollowUp: over.isFollowUp ?? false,
+			resultPath: "/ws/.attempts/attempt-002/result.json",
+		});
+	};
+
+	it("read-only workers get explicit fenced-json delivery with the exact required identifiers", () => {
+		const env = render(["read", "grep", "find", "ls", "bash"]); // installed researcher allowlist
+		assert.match(env, /ONE fenced ```json code block/);
+		assert.match(env, /"jobId": "job-ro-1"/);
+		assert.match(env, /"attemptId": "attempt-002"/);
+		assert.match(env, /no file is required or expected/);
+		assert.match(env, /Your final message MUST contain exactly one fenced ```json block/);
+		assert.match(env, /every\n  field in the shape is required/);
+	});
+
+	it("read-only contract carries NO contradictory file mandate anywhere in the envelope", () => {
+		const env = render(["read", "bash"]);
+		assert.doesNotMatch(env, /You MUST finish by writing a JSON file/);
+		assert.doesNotMatch(env, /Write result\.json BEFORE your final message/);
+		assert.doesNotMatch(env, /update result\.json at the path/);
+		assert.doesNotMatch(env, /record what you verified in result\.json/);
+		assert.doesNotMatch(env, /Write all large outputs/);
+	});
+
+	it("read-only follow-ups ask for an updated fenced result, not a file update", () => {
+		const env = render(["read"], { isFollowUp: true });
+		assert.match(env, /deliver your updated result exactly as OUTPUT CONTRACT specifies \(one fenced ```json block/);
+		assert.doesNotMatch(env, /update result\.json/);
+	});
+
+	it("write-capable workers retain the file-delivery preference", () => {
+		for (const caps of [undefined, [], ["read", "edit", "bash"]]) {
+			const env = render(caps);
+			assert.match(env, /You MUST finish by writing a JSON file/);
+			assert.match(env, /Write result\.json BEFORE your final message/);
+			assert.doesNotMatch(env, /no file is required or expected/);
+		}
+	});
+
+	it("resultDeliveryFor maps tool allowlists without a write tool to fenced-message", () => {
+		assert.equal(resultDeliveryFor({ capabilities: undefined }), "file");
+		assert.equal(resultDeliveryFor({ capabilities: [] }), "file");
+		assert.equal(resultDeliveryFor({ capabilities: ["read", "edit", "bash"] }), "file");
+		assert.equal(resultDeliveryFor({ capabilities: ["read", "bash"] }), "fenced-message");
+		assert.equal(resultDeliveryFor({ capabilities: ["read", "grep", "find", "ls", "bash"] }), "fenced-message");
+		assert.equal(resultDeliveryFor({ capabilities: ["read"] }), "fenced-message");
 	});
 });
