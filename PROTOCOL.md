@@ -52,15 +52,24 @@ experiments with no agent changes.
 Each attempt spawns an isolated pi subprocess (built in `core/spawn.ts`):
 
 ```
-pi --mode json -p
+pi --mode rpc
    --session-dir <attempt>/session --session-id <jobId>-<attemptId>
    --model <resolved provider/model> [--thinking effort]
-   [--tools capabilities] [--no-context-files] [--no-skills]
+   [--tools capabilities,+message_main,+ask_main,+ask_user_question]
+   [--no-context-files] [--no-skills]
    --append-system-prompt <attempt>/SYSTEM.md      # AGENT.md body
-   -e core/worker.ts [-e agent hooks...]           # dedicated hooks
+   -e worker.ts [-e agent hooks...]                # dedicated hooks
    --no-extensions                                  # no recursion/lockdown leakage
-   "<rendered job envelope>"
+   # the rendered job envelope travels as a stdin `prompt` command (never argv);
+   # genuine completion is the agent_settled event, after which stdin closes
+   # gracefully so RPC mode flushes its final output
 ```
+
+- RPC mode also carries live messaging: worker `notify`/`input` dialogs are
+  the transport for message_main / ask_main / ask_user_question, answered by
+  the parent broker over correlated `extension_ui_response` records; the
+  control handle steers a live worker (`jobs action=message`). No tmux, no
+  sockets, no mailboxes (§13).
 
 - Sanitized child env (§30): PATH/HOME/proxies + needed provider keys + agent
   `env` + `PI_ORCHESTRATOR_*` (JOB_ID, ATTEMPT_DIR, ARTIFACTS, RESULT_PATH,
@@ -70,12 +79,23 @@ pi --mode json -p
   / timeout / auth are **transport** errors → in-attempt exponential-backoff
   retries that never consume the task ladder. Task errors → ladder.
 - Timeouts, Esc-abort (SIGTERM→SIGKILL), crash → attempt persisted as
-  `interrupted` and recovered on next load.
+  `interrupted` and recovered on next load. Recovery is owner-aware: an attempt
+  whose `ownerPid` is alive (or whose death cannot be disproved —
+  `process.kill(pid, 0)` success, EPERM, or uncertain errors) is never touched,
+  so any `listJobs`/`readJob` call, from any process, leaves live running jobs
+  alone and emits no `job.interrupted`; only provably dead, invalid, or
+  pre-`ownerPid` orphan records are recovered — idempotently, exactly one
+  `job.interrupted` per recovered attempt.
 
 ## 3. Canonical upstream protocol: result.json (schema v1)
 
-Workers MUST write `<attempt>/result.json` (path given in the envelope's OUTPUT
-CONTRACT and via `PI_ORCHESTRATOR_RESULT_PATH`):
+Write-capable workers MUST write `<attempt>/result.json` (path given in the
+envelope's OUTPUT CONTRACT and via `PI_ORCHESTRATOR_RESULT_PATH`).
+Write-restricted workers (a tool allowlist without `edit`/`write`, e.g. the
+researcher) cannot write files: their OUTPUT CONTRACT instead mandates ONE
+schema-valid fenced ```json block in the final message, carrying the exact
+`jobId`/`attemptId` and every required field. Same schema either way; the
+extraction pipeline below picks up the fenced block when no result.json exists:
 
 ```json
 { "schemaVersion": 1, "jobId": "...", "attemptId": "...",
@@ -143,13 +163,48 @@ failed | waiting | cancelled | interrupted.
 - Budgets: per-attempt/per-job/daily USD ceilings + maxTurns/maxOutputTokens/
   timeout; violations are machine-readable (`budget exceeded: perJobUsd:2`).
 
-## 7. DAG & concurrency
+## 7. DAG & incremental scheduling
 
-`delegate {jobs:[{id, dependsOn:[...]}]}` creates a batch; the scheduler runs
-ready jobs concurrently (global + per-alias gates), propagates dependency
-failures downstream without running blocked jobs, detects cycles, and expands
-scoped runs to transitive dependencies. `jobs.graph` shows effective states
-without injecting results into context.
+`delegate {jobs:[{id, dependsOn:[...]}]}` creates a batch; scheduling is
+**incremental**: each job starts as soon as its own declared prerequisites
+have succeeded — there is no batch-wide barrier — under global and per-alias
+gates, propagating dependency failures downstream without running blocked
+jobs, detecting cycles, and expanding scoped runs to transitive dependencies.
+The DAG is orchestrator-owned: workers never add, remove, or reorder edges,
+and they never retry on their own. Slicing guidance (frontier prompt):
+outcomes must be independently verifiable, a split is justified only by the
+parallel gain versus the startup/context/coordination cost of another job,
+and tightly coupled implementation plus its tests stays in one job.
+`jobs.graph` shows effective states without injecting results into context.
+
+## 7a. Peer communication: checkpoint mailbox
+
+Workers get exactly two public mailbox tools: `mailbox_send(toJobId, body)`
+persists a short, bounded message for a specific peer job, and
+`mailbox_read()` returns the worker's own persisted, bounded inbox. Delivery
+is by **checkpoint**: pending messages are handed over when a worker
+checkpoints, and messages received during a run are injected into context
+marked **untrusted peer evidence** — claims from a peer job, never
+instructions or verified truth. Messages carry only concrete blockers,
+interface questions, and discoveries a peer needs; the orchestrator supplies
+the relevant peer job IDs and their roles in each job's task context and
+observes all traffic with `jobs action=messages <jobId>`. Sending never wakes
+or unblocks a finished worker — it only persists for checkpoint delivery.
+Dependency handoffs and mailbox traffic are **evidence only**: integration of
+changed code across isolated worktrees remains an explicit responsibility
+(named handoff/merge owner) followed by one final end-to-end validation.
+
+Delivery is **bounded at-least-once**, never exactly-once: checkpoint
+delivery writes a durable per-message receipt only after the enqueue
+succeeded, so a crash in between can re-deliver a batch — a possible
+duplicate is preferred over message loss. Bounds: 4096 UTF-8 bytes per
+message, 8 messages read per batch (32 max), 16 KiB of bodies per batch,
+at most 3 automatic mailbox-only continuations per worker run. The manual
+`mailbox_read()` tool has normal consuming tool-read semantics: it
+acknowledges exactly the batch it returns when the tool executes (like
+reading a queue) — it is not an exactly-once handoff to the model.
+`jobs action=messages` is read-only inspection and never consumes the
+queue.
 
 ## 8. Workspaces (§14)
 
@@ -160,10 +215,11 @@ automatically. Non-git dirs degrade to `cwd`.
 
 ## 9. Main-agent lockdown (§8)
 
-With a `role: main` agent present: active tools = `delegate` + `jobs` only,
-hard `tool_call` block on everything else, orchestrator prompt + roster +
-alias registry injected each turn. The main agent reasons, decomposes,
-delegates, inspects summaries, retries/escalates — it cannot implement.
+With a `role: main` agent present: active tools = `delegate` + `jobs` +
+`ask_user_question` only, hard `tool_call` block on everything else,
+orchestrator prompt + roster + alias registry injected each turn. The main
+agent reasons, decomposes, delegates, inspects summaries, retries/escalates —
+it cannot implement (it can only ask the human user questions).
 
 ## 10. Metrics (§21)
 
@@ -187,7 +243,8 @@ No learned router in V1.
 Provider-level retries remain inside one attempt. If they exhaust with
 `provider_unavailable`/`transport_error`, the job enters explicit, inspectable
 `failed` state and no reasoning/model ladder rung is consumed. A process crash leaves a
-running attempt; reload marks it `interrupted`, emits `job.interrupted`, and a
+running attempt; reload marks it `interrupted` (only when its `ownerPid` is dead
+or unrecorded — live owners are protected), emits `job.interrupted`, and a
 fresh retry allocates a new attempt while retaining the interrupted record.
 
 ## 12. Runtime API (§24, UI-independent)
@@ -197,3 +254,40 @@ readAttempt, readResult, readArtifact, runJob, runGraph, followupJob, retryJob,
 cancelJob, graph, waitJobs, events — the same primitives the pi tools use;
 future web/mobile/CI interfaces reuse them directly. Worker execution is an
 injectable seam (`config.workerRunner`) used by the deterministic test suite.
+
+## 13. Live agent messaging (phase 2, no tmux)
+
+Workers run in RPC mode, so live messaging rides pi's native extension-UI
+subprotocol — the parent broker (`core/broker.ts`) owns correlation and
+lifecycle; nothing here spawns shells or multiplexers:
+
+- **Wire protocol** (`core/messaging.ts`): versioned, bounded envelopes
+  (`PI-ORCH-MSG:v1:`) for one-way messages (`message_main`) and blocking requests
+  (`ask_main`, `ask_user_question`; 2..8 options, optional descriptions,
+  `allowCustom`, `timeoutSeconds` 1..900 default 300). Replies are explicit:
+  `answered | cancelled | timeout | unavailable | error` — never a fabricated
+  answer.
+- **Parent broker**: live controls keyed by `jobId+attemptId`; pending requests
+  keyed by `jobId+attemptId+rpc.id`, settled EXACTLY ONCE. Messages and request
+  lifecycle are durable events in `events.jsonl`; the bounded inbox keeps the
+  latest 100 items per job. Per-request deadlines are parent-enforced: the
+  pending UI is aborted and settled `timeout` when the deadline fires; worker
+  exit settles `cancelled`. Requests from an old process are stale forever —
+  late replies reject as unknown/expired.
+- **Deadlock-free attention**: `delegate` and `jobs wait` return EARLY with the
+  running jobIds and pending requestIds when a worker messages or asks; the
+  actual run promise continues, tracked in the background (single flight per
+  job; `jobs cancel` and session shutdown own its lifecycle). Later attention
+  and background completions reach the main model via deduplicated
+  `pi.sendMessage` typed custom messages. The main agent answers with
+  `jobs action=reply jobId=<job> requestId=<id> answer="..."`; `jobs
+  action=message` steers a live worker (delivery claimed only on steer ACK);
+  `jobs action=inbox` lists messages + pending requests. Concurrent runs,
+  retries, and follow-ups are rejected while a job's worker is live.
+- **User questions**: `ask_user_question` renders ONE interactive popup in the
+  main session (options + descriptions, up/down + Enter, typed custom answer,
+  Escape cancel, FIFO queue, deadlines honoured even while queued). The same
+  component is the main agent's own `ask_user_question` tool, active under
+  main lockdown. Headless/no-UI sessions return `unavailable` immediately.
+- Job status stays `running` while a worker waits; DAG dependents await the
+  actual result.

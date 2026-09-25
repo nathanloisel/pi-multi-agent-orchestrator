@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import { parse as yamlParse } from "yaml";
 import { discoverAgents, orchestratorRoot, type AgentConfig } from "./discovery.ts";
 import { rosterText, orchestratorPrompt } from "./core/prompts.ts";
+import { listMailboxMessages, MAILBOX_DEFAULT_READ_LIMIT } from "./core/mailbox.ts";
 import { ModelRegistry } from "./core/models.ts";
 import { Router, type RoutingRule } from "./core/routing.ts";
 import { JobStore, readJson } from "./core/storage.ts";
@@ -40,6 +41,9 @@ import {
 import { EventLog } from "./core/events.ts";
 import { BudgetManager } from "./core/budget.ts";
 import { ConcurrencyManager } from "./core/concurrency.ts";
+import type { AttentionItem, HumanQuestionHandler, InboxItem, InboxRequest, RoutedQuestion } from "./core/broker.ts";
+import type { WorkerReply } from "./core/messaging.ts";
+import { askUserQuestion, disposeQuestionUi } from "./ask-user.ts";
 import { Orchestrator, type CreateJobInput, type RunReport } from "./core/orchestrator.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "./core/telemetry.ts";
 import { scaffoldOrchestratorFiles } from "./core/scaffold.ts";
@@ -59,7 +63,9 @@ import {
 	type PlanSnapshot,
 } from "./core/types.ts";
 
-const ORCHESTRATOR_TOOLS = new Set(["delegate", "jobs"]);
+const ORCHESTRATOR_TOOLS = new Set(["delegate", "jobs", "ask_user_question"]);
+/** customType for pi.sendMessage notifications that must reach the main LLM. */
+const MAIN_MESSAGE_TYPE = "orchestrator-message";
 const MAX_PARALLEL_TASKS = 16;
 const SUMMARY_CAP = 4 * 1024;
 const PROGRESS_WIDGET_ID = "orchestrator-progress";
@@ -325,6 +331,213 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	// ── Live messaging (phase 2): attention yielding + background runs ──────
+	//
+	// delegate and jobs.wait normally BLOCK the main LLM until the run
+	// finishes. When a worker sends a message or an ask_main request, the
+	// blocking tool returns EARLY with the running job ids and pending request
+	// ids while the actual run promise continues, tracked here. Later worker
+	// attention and background completions reach the main model through
+	// pi.sendMessage typed custom messages (deduplicated by inbox item id).
+
+	interface AttentionRace {
+		jobIds: Set<string>;
+		deliver: (attention: AttentionItem) => void;
+	}
+
+	interface BackgroundRun {
+		key: string;
+		jobIds: string[];
+		controller: AbortController;
+		onSettled?: () => void;
+	}
+
+	let activeRaces: AttentionRace[] = [];
+	let backgroundRuns = new Map<string, BackgroundRun>();
+	let unlistenAttention: (() => void) | null = null;
+	const notifiedAttention = new Set<string>();
+
+	/** Wire the current orchestrator's broker to this session (attention + human questions). */
+	function attachLiveMessaging(): void {
+		if (!orch) return;
+		unlistenAttention?.();
+		unlistenAttention = orch.onAttention(dispatchAttention);
+		orch.setHumanQuestionHandler(handleRoutedQuestion);
+	}
+
+	/** New attention: hand it to a blocking tool racing on these jobs, else wake the main model. */
+	function dispatchAttention(attention: AttentionItem): void {
+		for (const race of activeRaces) {
+			if (race.jobIds.has(attention.jobId)) {
+				race.deliver(attention);
+				return;
+			}
+		}
+		notifyMain(attention);
+	}
+
+	/** Wake the main LLM with a typed custom message (deduplicated; never raw streams). */
+	function notifyMain(attention: AttentionItem): void {
+		if (notifiedAttention.has(attention.id)) return;
+		notifiedAttention.add(attention.id);
+		if (notifiedAttention.size > 1000) notifiedAttention.clear();
+		try {
+			// Custom messages participate in LLM context; triggerTurn wakes an
+			// idle main agent, deliverAs steer delivers before the next LLM call when busy.
+			pi.sendMessage({ customType: MAIN_MESSAGE_TYPE, content: renderAttentionText(attention), display: true }, { triggerTurn: true, deliverAs: "steer" });
+		} catch {
+			/* notifications must never break orchestration */
+		}
+	}
+
+	function renderAttentionText(attention: AttentionItem): string {
+		if (attention.kind === "message" && attention.message) {
+			return `[orchestrator] message from worker job ${attention.message.jobId}: ${attention.message.text}\n(One-way message_main — no reply is expected.)`;
+		}
+		if (attention.request) {
+			const r = attention.request;
+			return [
+				`[orchestrator] job ${r.jobId} (agent ${r.agent}) is BLOCKED waiting for your answer — requestId: ${r.requestId}`,
+				r.question,
+				`Answer with: jobs action=reply jobId=${r.jobId} requestId=${r.requestId} answer="..." (times out after ${r.timeoutSeconds}s)`,
+			].join("\n");
+		}
+		return "[orchestrator] worker attention";
+	}
+
+	function notifyBackgroundCompletion(text: string): void {
+		try {
+			pi.sendMessage({ customType: MAIN_MESSAGE_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "steer" });
+		} catch {
+			/* notifications must never break orchestration */
+		}
+	}
+
+	function renderReportNotification(report: RunReport): string {
+		return `[orchestrator] background job ${report.jobId} finished: ${report.status}${report.summaryForOrchestrator ? `\n${cap(report.summaryForOrchestrator, 2 * 1024)}` : ""}`;
+	}
+
+	/** Race a run promise against NEW attention on the given jobs; exactly one outcome wins. */
+	function raceRunAttention<T>(run: Promise<T>, jobIds: Set<string>): Promise<{ attention?: AttentionItem; report?: T; error?: Error }> {
+		return new Promise((resolve) => {
+			const race: AttentionRace = {
+				jobIds,
+				deliver: (attention) => {
+					remove();
+					resolve({ attention });
+				},
+			};
+			const remove = () => {
+				const i = activeRaces.indexOf(race);
+				if (i >= 0) activeRaces.splice(i, 1);
+			};
+			activeRaces.push(race);
+			run.then(
+				(report) => {
+					remove();
+					resolve({ report });
+				},
+				(error) => {
+					remove();
+					resolve({ error: error instanceof Error ? error : new Error(String(error)) });
+				},
+			);
+		});
+	}
+
+	/** Track a run continuing in the background after a yield; notify the main model on settle. */
+	function registerBackgroundRun(key: string, jobIds: string[], controller: AbortController, run: Promise<RunReport | RunReport[]>, onSettled?: () => void): void {
+		const tracked: BackgroundRun = { key, jobIds, controller, onSettled };
+		backgroundRuns.set(key, tracked);
+		Promise.resolve(run).then(
+			(report) => {
+				if (backgroundRuns.get(key) === tracked) backgroundRuns.delete(key);
+				tracked.onSettled?.();
+				notifyBackgroundCompletion(Array.isArray(report) ? report.map(renderReportNotification).join("\n\n") : renderReportNotification(report));
+			},
+			(err) => {
+					if (backgroundRuns.get(key) === tracked) backgroundRuns.delete(key);
+				tracked.onSettled?.();
+				notifyBackgroundCompletion(`[orchestrator] background run failed: ${err instanceof Error ? err.message : String(err)}`);
+			},
+		);
+	}
+
+	/** The EARLY tool result that hands attention back to the main model. */
+	function renderYieldResult(items: InboxItem[], jobIds: string[], source: string): { content: { type: "text"; text: string }[]; details: Record<string, unknown>; isError: boolean } {
+		const pending = items.filter((i): i is InboxRequest => i.type === "request" && i.status === "pending" && i.kind === "ask_main");
+		const userQuestions = items.filter((i): i is InboxRequest => i.type === "request" && i.status === "pending" && i.kind === "ask_user_question");
+		const messages = items.filter((i) => i.type === "message");
+		const lines: string[] = [];
+		lines.push(`${source} yielded — ${jobIds.join(", ")} ${jobIds.length === 1 ? "is" : "are"} still RUNNING in the background.`);
+		if (messages.length > 0) {
+			lines.push("Messages:");
+			for (const m of messages) lines.push(`- [${m.direction === "worker" ? "worker" : "main"} · job ${m.jobId}] ${m.text}`);
+		}
+		for (const r of pending) {
+			lines.push(`PENDING ask_main from job ${r.jobId} (agent ${r.agent}) — requestId: ${r.requestId}`);
+			lines.push(`Question: ${r.question}`);
+			lines.push(`Answer with: jobs action=reply jobId=${r.jobId} requestId=${r.requestId} answer="..." (times out after ${r.timeoutSeconds}s)`);
+		}
+		for (const r of userQuestions) {
+			lines.push(`A question for the USER from job ${r.jobId} (agent ${r.agent}) is open in the UI: ${r.question}`);
+		}
+		lines.push("The background run continues and you will be notified when it finishes. Keep working or wait; do NOT re-delegate, retry, or follow up these jobs while they run — use jobs action=message to send guidance to a live worker.");
+		return { content: [{ type: "text", text: lines.join("\n") }], details: { yielded: true, jobIds, pendingRequests: pending }, isError: false };
+	}
+
+	/** Human-question seam: render a worker-routed ask_user_question in the main session UI. */
+	const handleRoutedQuestion: HumanQuestionHandler = async (routed: RoutedQuestion, rpc): Promise<WorkerReply> => {
+		const ctx = uiCtx;
+		const identity = `job ${routed.jobId} · agent ${routed.agent} · attempt ${routed.attemptId}`;
+		if (!ctx || ctx.hasUI === false || (ctx.mode !== "tui" && ctx.mode !== "rpc")) {
+			return { status: "unavailable", reason: "no interactive UI is attached to the orchestrator main session; re-run the job where the main agent has a UI" };
+		}
+		const out = await askUserQuestion(
+			ctx,
+			{
+				question: routed.request.question,
+				options: routed.request.options,
+				allowCustom: routed.request.allowCustom ?? true,
+				timeoutSeconds: routed.request.timeoutSeconds,
+			},
+			{ identity, signal: rpc.signal },
+		);
+		switch (out.status) {
+			case "answered":
+				return { status: "answered", answer: out.answer };
+			case "cancelled":
+				return { status: "cancelled" };
+			case "timeout":
+				return { status: "timeout" };
+			default:
+				return { status: "unavailable", reason: out.reason };
+		}
+	};
+
+	/** Session teardown: dispose races, background runs, pending questions, broker state. */
+	function teardownLiveMessaging(): void {
+		unlistenAttention?.();
+		unlistenAttention = null;
+		activeRaces = [];
+		for (const run of backgroundRuns.values()) {
+			try {
+				run.controller.abort();
+			} catch {
+					/* best effort */
+			}
+			run.onSettled?.();
+		}
+		backgroundRuns.clear();
+		notifiedAttention.clear();
+		disposeQuestionUi();
+		try {
+			orch?.broker.dispose();
+		} catch {
+			/* best effort */
+		}
+	}
+
 	function buildRuntime(cwd: string, sessionModel?: { provider?: string; model?: string; effort?: string }) {
 		const discovery = discoverAgents(cwd, { includeProject: false });
 		agents = discovery.agents;
@@ -401,6 +614,8 @@ export default function (pi: ExtensionAPI) {
 		clearProgressWidget(ctx);
 		attachProgressListener();
 		restoreProgressFromBranch(ctx);
+		// Live messaging: the fresh Orchestrator's broker is session-owned.
+		attachLiveMessaging();
 		// Concise startup diagnostic: which orchestrator source loaded and whether
 		// this build carries structured-plan publishing. No secrets, once per load.
 		const sourceDiagnostic = `src:${path.join(HERE, "index.ts")} · structured-plan:v${PLAN_SCHEMA_VERSION}`;
@@ -444,6 +659,7 @@ export default function (pi: ExtensionAPI) {
 	// Clear progress UI + observers on teardown (quit, /reload, session swap).
 	pi.on("session_shutdown", async (_event, ctx) => {
 		resetProgress();
+		teardownLiveMessaging();
 		uiCtx = null;
 		clearProgressWidget(ctx);
 		try {
@@ -552,7 +768,7 @@ export default function (pi: ExtensionAPI) {
 			"Use delegate for ALL work requiring file access, commands, search, images, or code changes — the orchestrator has no direct tools.",
 			"You own synthesis, diagnosis, and design; use delegate for bounded work — workers collect facts or implement decided changes, not open-ended architecture.",
 			"Write delegate tasks for a focused cheap model with zero conversation context: objective, exact targets, chosen approach/steps, boundaries/non-goals, expected cases, and the validation command.",
-			"Use delegate with the fewest coherent jobs: keep related changes and their specified tests together, batch only independent jobs with dependsOn, and never create one job per file or command.",
+			"Slice work into the smallest independently verifiable outcomes that justify coordination overhead; declare write ownership, prerequisites, acceptance checks, and integration responsibility, and batch independent jobs with explicit dependencies.",
 			"Use delegate followup for related bounded corrections; let the automatic retry ladder handle execution errors and replan a bad specification instead of retrying it.",
 		],
 		parameters: Type.Object({
@@ -613,14 +829,30 @@ export default function (pi: ExtensionAPI) {
 						/* progress UI must never affect jobs */
 					}
 					// Stream real transitions ("running" only once attempt.started
-					// confirms it); terminal truth arrives via the final report.
+					// confirms it); terminal truth arrives via the final report — or the
+					// early yield below when the worker needs the main agent's attention.
 					const unstream = streamJobEvents(o, job.jobId, toolStream(onUpdate));
-					let report: RunReport;
-					try {
-						report = await o.runJob(job, agents, signal);
-					} finally {
-						unstream();
+					// Abort ownership: while this tool actively waits, its signal cancels
+					// the work; after a messaging yield the background run is owned by
+					// jobs cancel + session shutdown instead (the tool finalizing must
+					// never abort a still-running worker).
+					const runController = new AbortController();
+					const forwardAbort = () => runController.abort();
+					if (signal?.aborted) runController.abort();
+					else signal?.addEventListener("abort", forwardAbort, { once: true });
+					const launched = o.runJob(job, agents, runController.signal);
+					const raced = await raceRunAttention(launched, new Set([job.jobId]));
+					if (raced.attention) {
+						// DEADLOCK-FREE yielding: return EARLY with the pending request
+						// ids while the run continues, tracked in the background.
+						signal?.removeEventListener("abort", forwardAbort);
+						registerBackgroundRun(job.jobId, [job.jobId], runController, launched, unstream);
+						const items = o.inbox(job.jobId); // reading consumes the attention
+						return renderYieldResult(items, [job.jobId], "delegate");
 					}
+					unstream();
+					if (raced.error) throw raced.error;
+					const report: RunReport = raced.report!;
 					try {
 						onUpdate?.({ content: [{ type: "text" as const, text: `job ${job.jobId}: ${report.status}` }], details: { jobId: job.jobId } });
 					} catch {
@@ -650,8 +882,14 @@ export default function (pi: ExtensionAPI) {
 				// Stream per-job results as they settle so partially-completed batches
 				// are visible while the remaining jobs keep running.
 				const settled: RunReport[] = [];
-				const reports = await o.runGraph(agents, {
-					signal,
+				// Abort ownership mirrors the single path: after a messaging yield the
+				// DAG continues in the background (jobs cancel + shutdown own it).
+				const runController = new AbortController();
+				const forwardAbort = () => runController.abort();
+				if (signal?.aborted) runController.abort();
+				else signal?.addEventListener("abort", forwardAbort, { once: true });
+				const launched = o.runGraph(agents, {
+					signal: runController.signal,
 					jobIds: created.map((c) => c.jobId),
 					onJobUpdate: (report) => {
 						try {
@@ -665,7 +903,17 @@ export default function (pi: ExtensionAPI) {
 						}
 					},
 				});
-				return renderRunReports(reports, created);
+				const raced = await raceRunAttention(launched, new Set(createdIds));
+				if (raced.attention) {
+					// Yield the batch: the DAG (including dependent waits) continues
+					// in the background; dependencies still await actual results.
+					signal?.removeEventListener("abort", forwardAbort);
+					registerBackgroundRun(created[0].jobId, createdIds, runController, launched);
+					const items = createdIds.flatMap((id) => o.inbox(id)); // consumes the attention
+					return renderYieldResult(items, createdIds, "delegate batch");
+				}
+				if (raced.error) throw raced.error;
+				return renderRunReports(raced.report!, created);
 			} catch (e) {
 				const err = e as Error & { detail?: { available?: string[] } };
 				return {
@@ -708,24 +956,27 @@ export default function (pi: ExtensionAPI) {
 		name: "jobs",
 		label: "Jobs",
 		description:
-			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> | plan steps=[...] (publish/revise the structured plan) | metrics.",
-		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/followup/retry/cancel/wait/plan/metrics",
+			"Job runtime control & inspection. Actions: list | status <jobId> | read <jobId> (canonical result.json summary) | artifact <jobId,path[,attemptId]> | graph | events <jobId> | attempts <jobId> | messages <jobId> (read-only listing of stored mailbox messages; never consumes them) | followup <jobId,message> (resume worker session — cheapest) | retry <jobId[,strategy=resume|fresh][,model=alias]> | cancel <jobId> | wait <jobId[,jobId...]> (yields early when a worker messages or asks) | inbox [jobId] (live messages + pending requests) | message <jobId,message> (steer a LIVE worker; delivered only on ACK) | reply <jobId,requestId,answer> (answer a pending ask_main) | plan steps=[...] (publish/revise the structured plan) | metrics.",
+		promptSnippet: "Job control: list/status/read/artifact/graph/events/attempts/messages/followup/retry/cancel/wait/inbox/message/reply/plan/metrics",
 		promptGuidelines: [
 			"Publish the structured plan with jobs action=plan BEFORE delegating for any multi-step task; each step needs a stable id and a clear human-readable title, and the step id should equal the delegate job alias id (delegate id=...) so the workspace can bind them.",
 			"Omit unchanged steps when revising a plan — they are retained; only real changes need a new revision, and statuses advance planned → running → completed/failed/blocked/cancelled/superseded.",
 			"Use jobs.followup for small corrections (resumes the worker's session); use jobs.retry strategy=fresh when the worker is stuck, optionally escalating model (worker-best, frontier).",
 			"Use jobs.read and jobs.artifact to pull details on demand — never request full logs into context.",
+			"Use jobs.messages <jobId> to inspect a job's stored peer mailbox read-only (bounded listing); workers consume their own inbox via the mailbox_read tool.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(
-				["list", "status", "read", "artifact", "graph", "events", "attempts", "followup", "retry", "cancel", "wait", "plan", "metrics"] as const,
+				["list", "status", "read", "artifact", "graph", "events", "attempts", "messages", "followup", "retry", "cancel", "wait", "inbox", "message", "reply", "plan", "metrics"] as const,
 			),
-			jobId: Type.Optional(Type.String()),
+			jobId: Type.Optional(Type.String({ description: "target job id (required for status/read/artifact/events/attempts/messages/followup/retry/cancel/wait)" })),
 			path: Type.Optional(Type.String({ description: "artifact relative path (action: artifact)" })),
 			attemptId: Type.Optional(Type.String()),
 			message: Type.Optional(Type.String({ description: "follow-up instruction (action: followup)" })),
 			strategy: Type.Optional(StringEnum(["resume", "fresh"] as const, { description: "retry strategy (default: fresh)" })),
 			model: Type.Optional(Type.String({ description: "logical alias override for retry (worker-cheap/worker-best/frontier)" })),
+			requestId: Type.Optional(Type.String({ description: "pending ask_main request id (actions: reply)" })),
+			answer: Type.Optional(Type.String({ description: "answer text for a pending ask_main request (actions: reply)" })),
 			planId: Type.Optional(Type.String({ description: "stable plan id (omit to continue the current branch's plan)" })),
 			steps: Type.Optional(
 				Type.Array(
@@ -859,6 +1110,18 @@ export default function (pi: ExtensionAPI) {
 								.join("\n") || "(no attempts)",
 						);
 					}
+					case "messages": {
+						if (!params.jobId) return needsId();
+						// Read-only listing: listMailboxMessages never acknowledges and
+						// never creates files, so inspection cannot consume the queue.
+						const messages = await listMailboxMessages(root, params.jobId, { limit: MAILBOX_DEFAULT_READ_LIMIT });
+						if (messages.length === 0) return t(`No stored mailbox messages for ${params.jobId}.`);
+						const lines = messages.map((m) => {
+							const body = m.body.replace(/\s+/g, " ");
+							return `- ${m.createdAt} from ${m.fromJobId}/${m.fromAttemptId} [${m.id.slice(0, 8)}]: ${body.slice(0, 400)}${body.length > 400 ? " …" : ""}`;
+						});
+						return t(cap(`Stored mailbox messages for ${params.jobId} (${messages.length}, read-only — not consumed):\n${lines.join("\n")}`));
+					}
 					case "followup": {
 						if (!params.jobId || !params.message) return t("jobId and message are required.");
 						trackExplicitJob(params.jobId);
@@ -891,16 +1154,53 @@ export default function (pi: ExtensionAPI) {
 						if (!params.jobId) return needsId();
 						return t(o.cancelJob(params.jobId) ? `Cancelled ${params.jobId}` : `Cannot cancel ${params.jobId} (terminal or unknown)`);
 					}
+					case "message": {
+						if (!params.jobId || !params.message) return t("jobId and message are required.");
+						trackExplicitJob(params.jobId);
+						// Delivered only on steer ACK; explicit errors for non-running/failed control.
+						await o.messageJob(params.jobId, params.message);
+						return t(`delivered: message sent to the live worker of job ${params.jobId}`);
+					}
+					case "inbox": {
+						const items = o.inbox(params.jobId); // reading consumes attention
+						if (items.length === 0) return t("No live messages or requests yet." + (params.jobId ? "" : " (pass jobId for one job)"));
+						return t(renderInboxItems(items));
+					}
+					case "reply": {
+						if (!params.jobId || !params.requestId || !params.answer) return t("jobId, requestId, and answer are required.");
+						trackExplicitJob(params.jobId);
+						// Exact correlation only: duplicates, expired, and cross-job replies reject.
+						o.reply(params.jobId, params.requestId, params.answer);
+						return t(`delivered: answered request ${params.requestId} for job ${params.jobId}`);
+					}
 					case "wait": {
 						if (!params.jobId) return needsId();
 						const ids = params.jobId.split(",").map((s) => s.trim()).filter(Boolean);
 						for (const id of ids) trackExplicitJob(id);
-						const jobs = await o.waitJobs(ids, 300000, signal, (snapshot) => {
+						// Yield on pending ask_main / new worker messages instead of
+						// blocking the turn: the run keeps going in the background.
+						const waitController = new AbortController();
+						const forwardAbort = () => waitController.abort();
+						if (signal?.aborted) waitController.abort();
+						else signal?.addEventListener("abort", forwardAbort, { once: true });
+						const waiting = o.waitJobs(ids, 300000, waitController.signal, (snapshot) => {
 							safeOnUpdate({
 								content: [{ type: "text", text: `waiting: ${snapshot.map((j) => `${j.jobId}=${j.status}`).join(", ")}` }],
 								details: {},
 							});
 						});
+						const raced = await raceRunAttention(waiting, new Set(ids));
+						if (raced.attention) {
+							// Abandon the poller (state lives in the store) and yield.
+								waitController.abort();
+							signal?.removeEventListener("abort", forwardAbort);
+							const items = ids.flatMap((id) => o.inbox(id));
+							// Raw store read: crash recovery must not touch live jobs.
+							const jobs = ids.map((id) => o.store.readJob(id)).filter((j): j is JobRecord => Boolean(j));
+							return renderYieldResult(items, jobs.map((j) => j.jobId), "jobs.wait");
+						}
+						if (raced.error) throw raced.error;
+						const jobs = raced.report!;
 						return t(jobs.map((j) => `- ${j.jobId}: ${j.status}${j.lastSummary ? ` — ${j.lastSummary.slice(0, 120)}` : ""}`).join("\n"));
 					}
 					case "metrics": {
@@ -915,6 +1215,85 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: `jobs.${params.action} failed: ${(e as Error).message}` }], details: {}, isError: true };
 			}
 			return t("Unknown action.");
+		},
+	});
+
+	// ── ask_user_question (main tool; also the renderer for worker-routed asks) ─
+	pi.registerTool({
+		name: "ask_user_question",
+		label: "Ask User Question",
+		description:
+			"Ask the human user ONE question. Provide 2-8 named options (each with an optional description) or omit options for free text; allowCustom (default true) accepts a typed answer on top of the options. Renders an interactive popup in the main session (the same UI used for worker-routed questions). Returns the user's answer verbatim, or an explicit cancelled/timeout/unavailable result — never a fabricated answer.",
+		promptSnippet: "Ask the human user a single question with options or free text",
+		promptGuidelines: [
+			"Use ask_user_question when only the human user can decide something; ask ONE question per call with 2-8 concrete options (plus allowCustom for free text) and never invent the user's answer.",
+		],
+		parameters: Type.Object({
+			question: Type.String({ description: "The single question to ask" }),
+			options: Type.Optional(
+				Type.Array(
+					Type.Object({
+						label: Type.String({ description: "Display label for the option" }),
+						description: Type.Optional(Type.String({ description: "Optional description shown below the label" })),
+					}),
+					{ description: "2-8 named options; omit for free text" },
+				),
+			),
+			allowCustom: Type.Optional(Type.Boolean({ description: "accept a typed answer (default true)" })),
+			timeoutSeconds: Type.Optional(Type.Number({ description: "how long to wait (seconds, 1..900, default 300)" })),
+		}),
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const out = await askUserQuestion(
+				ctx,
+				{
+					question: params.question,
+					options: params.options,
+					allowCustom: params.allowCustom ?? true,
+					timeoutSeconds: params.timeoutSeconds,
+				},
+				{ signal },
+			);
+			switch (out.status) {
+				case "answered":
+					return {
+						content: [{ type: "text" as const, text: `User answered: ${out.answer}` }],
+						details: { question: params.question, answer: out.answer, wasCustom: out.wasCustom },
+					};
+				case "cancelled":
+					return {
+						content: [{ type: "text" as const, text: "User cancelled the question without answering" }],
+						details: { question: params.question, answer: null },
+					};
+				case "timeout":
+					return {
+						content: [{ type: "text" as const, text: `Timed out after ${params.timeoutSeconds ?? 300}s with no answer (no default was chosen)` }],
+						details: { question: params.question, answer: null },
+					};
+				default:
+					return {
+						content: [{ type: "text" as const, text: `unavailable: ${out.reason}` }],
+						details: { question: params.question, answer: null },
+						isError: true,
+					};
+			}
+		},
+		renderCall(args, theme) {
+			const a = args as { question?: string; options?: { label?: string }[] };
+			let text = `${theme.fg("toolTitle", theme.bold("ask_user_question "))}${theme.fg("muted", String(a.question ?? ""))}`;
+			const opts = Array.isArray(a.options) ? a.options : [];
+			if (opts.length) text += `\n  ${theme.fg("dim", `Options: ${opts.map((o, i) => `${i + 1}. ${o.label ?? "?"}`).join(", ")}`)}`;
+			return new Text(text, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { answer?: string | null; wasCustom?: boolean } | undefined;
+			const first = result.content[0];
+			const text = first?.type === "text" ? first.text : "";
+			if (details && typeof details.answer === "string") {
+				return new Text(`${theme.fg("success", "✓ ")}${theme.fg("accent", details.answer)}${details.wasCustom ? theme.fg("muted", " (typed)") : ""}`, 0, 0);
+			}
+			if (/^unavailable:/.test(text)) return new Text(theme.fg("error", text), 0, 0);
+			return new Text(theme.fg("warning", text || "Cancelled"), 0, 0);
 		},
 	});
 
@@ -973,6 +1352,24 @@ function renderRunReport(report: RunReport) {
 		details: { reports: [report] } as Record<string, unknown>,
 		isError: failed,
 	};
+}
+
+/** Bounded text rendering of live inbox items (messages + request lifecycle). */
+function renderInboxItems(items: InboxItem[]): string {
+	const lines: string[] = [];
+	for (const item of items) {
+		if (item.type === "message") {
+			const who = item.direction === "worker" ? `worker · job ${item.jobId}` : `main → worker · job ${item.jobId}${item.delivered ? "" : " (not delivered)"}`;
+			lines.push(`- [${new Date(item.createdAt).toISOString()}] ${who}: ${item.text}`);
+		} else {
+			const expires = Math.max(0, Math.round((item.createdAt + item.timeoutSeconds * 1000 - Date.now()) / 1000));
+			const status = item.status === "pending" ? `waiting (times out in ${expires}s)` : `${item.status}${item.answer ? `: ${item.answer}` : ""}`;
+			lines.push(`- [request ${item.requestId}] ${item.kind} · job ${item.jobId} (agent ${item.agent}) — ${status}`);
+			lines.push(`  question: ${item.question}`);
+			if (item.status === "pending" && item.kind === "ask_main") lines.push(`  answer with: jobs action=reply jobId=${item.jobId} requestId=${item.requestId} answer="..."`);
+		}
+	}
+	return cap(lines.join("\n"));
 }
 
 function renderRunReports(reports: RunReport[], created: JobRecord[]) {

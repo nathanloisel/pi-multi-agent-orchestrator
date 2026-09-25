@@ -22,7 +22,7 @@ import { fitDependencyHandoffs } from "../core/orchestrator.ts";
 import { renderDependencySection } from "../core/prompts.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "../core/telemetry.ts";
 import { DEFAULT_RETRY, normalizeJobResult, type AttemptRecord, type DependencyHandoff, type JobRecord } from "../core/types.ts";
-import { makeHarness, TEST_MODELS_YAML, tmpRoot, writeRegistry } from "./helpers.ts";
+import { makeAgent, makeHarness, outcome, TEST_MODELS_YAML, tmpRoot, writeRegistry } from "./helpers.ts";
 
 // ── Model registry ──────────────────────────────────────────────────────────
 
@@ -285,6 +285,25 @@ describe("JobStore", () => {
 		assert.equal(store.readAttempt("j2", attemptId)!.status, "interrupted");
 	});
 
+	it("listJobs preserves running attempts owned by this live process — no interruption, no event", () => {
+		const root = tmpRoot();
+		const store = new JobStore(root);
+		store.createJobDir("j-live");
+		const attemptId = store.allocateAttempt("j-live");
+		store.writeAttempt(mkAttempt({ jobId: "j-live", attemptId, status: "running", ownerPid: process.pid }));
+		store.writeJob(mkJob({ jobId: "j-live", status: "running", latestAttemptId: attemptId }));
+		let recoveries = 0;
+		store.setRecoveryHandler(() => {
+			recoveries++;
+		});
+		for (let i = 0; i < 2; i++) {
+			const listed = store.listJobs().find((j) => j.jobId === "j-live");
+			assert.equal(listed?.status, "running");
+			assert.equal(store.readAttempt("j-live", attemptId)?.status, "running");
+		}
+		assert.equal(recoveries, 0);
+	});
+
 	it("protects against artifact path traversal (§30)", () => {
 		const root = tmpRoot();
 		const store = new JobStore(root);
@@ -307,6 +326,218 @@ describe("JobStore", () => {
 		assert.equal(manifest[0].type, "log");
 		assert.equal(manifest[0].size, 5);
 		assert.equal(manifest[0].sha256!.length, 64);
+	});
+});
+
+// ── Owner-liveness orphan recovery (§29) ─────────────────────────────────────────
+
+describe("owner-liveness protection in recoverInterrupted", () => {
+	/** Temporarily replace process.kill for the duration of fn (tests run sequentially). */
+	function withMockedKill<T>(impl: () => boolean, fn: () => T): T {
+		const original = process.kill;
+		(process as unknown as { kill: () => boolean }).kill = impl;
+		try {
+			return fn();
+		} finally {
+			(process as unknown as { kill: typeof original }).kill = original;
+		}
+	}
+
+	function errno(code: string): NodeJS.ErrnoException {
+		const e = new Error(code) as NodeJS.ErrnoException;
+		e.code = code;
+		return e;
+	}
+
+	function makeRunningStore(ownerPid: number | undefined, suffix: string) {
+		const root = tmpRoot();
+		const store = new JobStore(root);
+		const jobId = `j-owner-${suffix}`;
+		store.createJobDir(jobId);
+		const attemptId = store.allocateAttempt(jobId);
+		store.writeAttempt(mkAttempt({ jobId, attemptId, status: "running", ownerPid }));
+		store.writeJob(mkJob({ jobId, status: "running", latestAttemptId: attemptId }));
+		return { store, jobId, attemptId };
+	}
+
+	it("dead owner (ESRCH) is recovered exactly once, idempotently", () => {
+		const { store, jobId, attemptId } = makeRunningStore(424242, "dead");
+		let recoveries = 0;
+		store.setRecoveryHandler(() => {
+			recoveries++;
+		});
+		withMockedKill(
+			() => {
+				throw errno("ESRCH");
+			},
+			() => {
+				const recovered = store.recoverInterrupted(store.readJob(jobId)!);
+				assert.equal(recovered.status, "interrupted");
+			},
+		);
+		assert.equal(store.readAttempt(jobId, attemptId)?.status, "interrupted");
+		assert.equal(store.readAttempt(jobId, attemptId)?.exitReason, "crashed");
+		assert.equal(recoveries, 1);
+		// a later scan (record no longer running) never recovers or re-emits
+		withMockedKill(
+			() => {
+				throw errno("ESRCH");
+			},
+			() => {
+				store.recoverInterrupted(store.readJob(jobId)!);
+				store.listJobs();
+			},
+		);
+		assert.equal(recoveries, 1);
+	});
+
+	it("EPERM (owner exists but is not signalable by us) is protected", () => {
+		const { store, jobId, attemptId } = makeRunningStore(424242, "eperm");
+		withMockedKill(
+			() => {
+				throw errno("EPERM");
+			},
+			() => {
+				assert.equal(store.recoverInterrupted(store.readJob(jobId)!).status, "running");
+				assert.equal(store.listJobs().find((j) => j.jobId === jobId)?.status, "running");
+			},
+		);
+		assert.equal(store.readAttempt(jobId, attemptId)?.status, "running");
+	});
+
+	it("uncertain probe errors are protected (conservative)", () => {
+		const { store, jobId, attemptId } = makeRunningStore(424242, "uncertain");
+		withMockedKill(
+			() => {
+				throw errno("EINVAL");
+			},
+			() => {
+				assert.equal(store.recoverInterrupted(store.readJob(jobId)!).status, "running");
+			},
+		);
+		withMockedKill(
+			() => {
+				throw new Error("probe exploded without an errno");
+			},
+			() => {
+				assert.equal(store.recoverInterrupted(store.readJob(jobId)!).status, "running");
+			},
+		);
+		assert.equal(store.readAttempt(jobId, attemptId)?.status, "running");
+	});
+
+	it("invalid ownerPid values are rejected WITHOUT probing (no group/self signals)", () => {
+		for (const [i, pid] of [0, -1, 1.5, Number.NaN].entries()) {
+			const { store, jobId, attemptId } = makeRunningStore(pid, `invalid-${i}`);
+			// the mock throws if ANY probe happens; recovery must proceed anyway
+			withMockedKill(
+				() => {
+					throw new Error("probe must not run for invalid pids");
+				},
+				() => {
+					assert.equal(store.recoverInterrupted(store.readJob(jobId)!).status, "interrupted", `pid ${pid} should recover unprobed`);
+				},
+			);
+			assert.equal(store.readAttempt(jobId, attemptId)?.status, "interrupted");
+		}
+	});
+
+	it("legacy records without ownerPid keep owner-agnostic recovery, exactly once", () => {
+		const { store, jobId, attemptId } = makeRunningStore(undefined, "legacy");
+		let recoveries = 0;
+		store.setRecoveryHandler(() => {
+			recoveries++;
+		});
+		assert.equal(store.recoverInterrupted(store.readJob(jobId)!).status, "interrupted");
+		assert.equal(recoveries, 1);
+		store.recoverInterrupted(store.readJob(jobId)!);
+		store.listJobs();
+		assert.equal(recoveries, 1);
+		assert.equal(store.readAttempt(jobId, attemptId)?.status, "interrupted");
+	});
+
+	it("orchestrator-level: listJobs on a live owner emits no job.interrupted event", () => {
+		const h = makeHarness();
+		const job = h.orch.createJob({ agent: "worker", task: "live owner" }, h.agents);
+		const attemptId = h.orch.store.allocateAttempt(job.jobId);
+		h.orch.store.writeAttempt({
+			schemaVersion: 1,
+			attemptId,
+			jobId: job.jobId,
+			agent: "worker",
+			retryMode: "initial",
+			status: "running",
+			startedAt: Date.now(),
+			ownerPid: process.pid,
+		});
+		job.status = "running";
+		job.latestAttemptId = attemptId;
+		h.orch.store.writeJob(job);
+		assert.equal(
+			h.orch.listJobs().find((j) => j.jobId === job.jobId)?.status,
+			"running",
+		);
+		assert.equal(h.orch.readAttempt(job.jobId, attemptId)?.status, "running");
+		assert.equal(h.orch.events.read(job.jobId).filter((e) => e.type === "job.interrupted").length, 0);
+		h.cleanup();
+	});
+});
+
+// ── Read-only follow-up delivery end-to-end (FENCED_FOLLOWUP_STALE_RESULT) ──
+
+describe("read-only follow-up extracts fresh fenced results (stale canonical guard)", () => {
+	const fenced = (jobId: string, attemptId: string, summary: string, metrics: Record<string, unknown> = {}) =>
+		`Refined result.\n\`\`\`json\n${JSON.stringify({
+			schemaVersion: 1,
+			jobId,
+			attemptId,
+			status: "success",
+			summary,
+			findings: [],
+			changes: [],
+			validation: { status: "skipped", checks: [] },
+			artifacts: [],
+			blockers: [],
+			followUps: [],
+			metrics,
+		}, null, 2)}\n\`\`\``;
+
+	it("follow-up summary B replaces stale A persisted in the reused attempt dir; malformed follow-up fails instead of reusing A", async () => {
+		const h = makeHarness({ agents: [makeAgent({ name: "ro-worker", capabilities: ["read", "bash"] })] });
+		try {
+			const job = h.orch.createJob({ agent: "ro-worker", task: "investigate" }, h.agents);
+			const attemptId = "attempt-001"; // follow-up resumes the SAME attempt dir
+
+			// 1) first run: fenced summary A (no file written by the worker; the
+			//    orchestrator persists the canonical result.json from the fenced block)
+			h.setWorker(() => outcome({ status: "success", summary: "first summary A" }, { writeResultFile: false, finalText: fenced(job.jobId, attemptId, "first summary A") }));
+			const run1 = await h.orch.runJob(job, h.agents);
+			assert.equal(run1.status, "success");
+			const attemptDir = h.orch.store.attemptDir(job.jobId, attemptId);
+			assert.ok(fs.existsSync(path.join(attemptDir, "result.json")), "stale canonical A must be present for the follow-up");
+			assert.equal(h.orch.readResult(job.jobId)?.summary, "first summary A");
+
+			// 2) follow-up: fresh fenced B must win over stale persisted A
+			h.setWorker(() => outcome({ status: "success", summary: "second summary B" }, { writeResultFile: false, finalText: fenced(job.jobId, attemptId, "second summary B", { run: 2 }) }));
+			const run2 = await h.orch.followupJob(job.jobId, "refine the answer", h.agents);
+			assert.equal(run2.status, "success");
+			assert.equal(h.orch.readResult(job.jobId)?.summary, "second summary B");
+			assert.equal(h.orch.readAttempt(job.jobId, attemptId)?.status, "success");
+
+			// 3) malformed follow-up: must FAIL (malformed_result), never reuse A or B
+			h.setWorker(() => outcome({ status: "success", summary: "prose" }, { writeResultFile: false, finalText: "Sorry, no structured output this time." }));
+			const run3 = await h.orch.followupJob(job.jobId, "again, structured please", h.agents);
+			assert.equal(run3.status, "waiting"); // failed follow-up → job waiting (retry pending), never stale success
+			const final = h.orch.readResult(job.jobId);
+			assert.equal(final?.status, "failure");
+			assert.notEqual(final?.summary, "first summary A");
+			assert.notEqual(final?.summary, "second summary B");
+			const attempt = h.orch.readAttempt(job.jobId, attemptId);
+			assert.equal(attempt?.status, "failed");
+			assert.equal(attempt?.exitReason, "malformed_result");
+		} finally {
+			h.cleanup();
+		}
 	});
 });
 
@@ -356,6 +587,99 @@ describe("extractResult", () => {
 		assert.equal(ex.source, "synthetic");
 		assert.equal(ex.result.status, "failure");
 		assert.ok(ex.result.blockers.length > 0);
+	});
+
+	it("accepts a complete schema-valid fenced result when result.json is absent (read-only delivery)", () => {
+		const dir = tmpRoot(); // no result.json — the worker could not write files
+		const full = {
+			schemaVersion: 1,
+			jobId: "j",
+			attemptId: "attempt-001",
+			status: "success",
+			summary: "read-only research complete",
+			findings: [{ severity: "info", code: "FOUND", message: "decisive fact", evidence: "core/x.ts:12" }],
+			changes: [],
+			validation: { status: "skipped", checks: [] },
+			artifacts: [],
+			blockers: [],
+			followUps: [],
+			metrics: { sources: 3 },
+		};
+		const ex = extractResult({ attemptDir: dir, finalText: `Research done.\n\`\`\`json\n${JSON.stringify(full, null, 2)}\n\`\`\`\n`, ...base });
+		assert.equal(ex.source, "json-block");
+		assert.deepEqual(ex.repairs, []); // schema-valid: no repairs needed
+		assert.equal(ex.result.status, "success");
+		assert.equal(ex.result.jobId, "j");
+		assert.equal(ex.result.attemptId, "attempt-001");
+		assert.equal(ex.result.summary, "read-only research complete");
+		assert.deepEqual(ex.result.findings[0], full.findings[0]);
+		assert.deepEqual(ex.result.metrics, { sources: 3 });
+		assert.equal(ex.result.validation.status, "skipped");
+	});
+
+	it("rejects a fenced json block that does not parse (synthetic failure, not silent acceptance)", () => {
+		const dir = tmpRoot();
+		const ex = extractResult({ attemptDir: dir, finalText: "done\n```json\n{ this is not json }\n```", ...base });
+		assert.equal(ex.source, "synthetic");
+		assert.equal(ex.result.status, "failure");
+		assert.ok(ex.repairs.some((r) => r.includes("not parseable")));
+		assert.ok(ex.result.blockers.some((b) => b.includes("did not follow the output contract")));
+	});
+
+	it("rejects prose-only output with no fenced block (malformed_result)", () => {
+		const dir = tmpRoot();
+		const ex = extractResult({ attemptDir: dir, finalText: "I looked around and things seem fine. No structured output here.", ...base });
+		assert.equal(ex.source, "synthetic");
+		assert.equal(ex.result.status, "failure");
+		assert.ok(ex.repairs.some((r) => r.includes("no machine-readable result")));
+	});
+
+	it("fenced-message delivery: fresh fenced B wins over a stale persisted A (follow-up reuse)", () => {
+		const dir = tmpRoot();
+		// canonical result.json persisted by a PREVIOUS run of this attempt
+		fs.writeFileSync(
+			path.join(dir, "result.json"),
+			JSON.stringify({ schemaVersion: 1, ...base, status: "success", summary: "first summary A", findings: [], changes: [], validation: { status: "skipped", checks: [] }, artifacts: [], blockers: [], followUps: [], metrics: {} }),
+		);
+		const freshB = { schemaVersion: 1, ...base, status: "success", summary: "second summary B", findings: [], changes: [], validation: { status: "skipped", checks: [] }, artifacts: [], blockers: [], followUps: [], metrics: { run: 2 } };
+		const ex = extractResult({
+			attemptDir: dir,
+			finalText: `Refined.\n\`\`\`json\n${JSON.stringify(freshB)}\n\`\`\``,
+			...base,
+			delivery: "fenced-message",
+		});
+		assert.equal(ex.source, "json-block");
+		assert.equal(ex.result.summary, "second summary B");
+		assert.deepEqual(ex.result.metrics, { run: 2 });
+		assert.ok(ex.repairs.some((r) => r.includes("persisted result.json ignored")));
+	});
+
+	it("fenced-message delivery: malformed fresh output FAILS instead of reusing stale A", () => {
+		const dir = tmpRoot();
+		fs.writeFileSync(
+			path.join(dir, "result.json"),
+			JSON.stringify({ schemaVersion: 1, ...base, status: "success", summary: "first summary A", findings: [], changes: [], validation: { status: "skipped", checks: [] }, artifacts: [], blockers: [], followUps: [], metrics: {} }),
+		);
+		const ex = extractResult({ attemptDir: dir, finalText: "Sorry, no structured output this time.", ...base, delivery: "fenced-message" });
+		assert.equal(ex.source, "synthetic");
+		assert.equal(ex.result.status, "failure");
+		assert.notEqual(ex.result.summary, "first summary A");
+		assert.ok(ex.repairs.some((r) => r.includes("persisted result.json ignored")));
+		// the stale file itself is never deleted before a successful extraction
+		assert.ok(fs.existsSync(path.join(dir, "result.json")));
+	});
+
+	it("file delivery (default and explicit) keeps file-first behavior unchanged", () => {
+		const dir = tmpRoot();
+		fs.writeFileSync(
+			path.join(dir, "result.json"),
+			JSON.stringify({ schemaVersion: 1, ...base, status: "success", summary: "from file", findings: [], changes: [], validation: { status: "skipped", checks: [] }, artifacts: [], blockers: [], followUps: [], metrics: {} }),
+		);
+		for (const delivery of [undefined, "file" as const]) {
+			const ex = extractResult({ attemptDir: dir, finalText: "```json\n{\"status\":\"failure\",\"summary\":\"message\"}\n```", ...base, delivery });
+			assert.equal(ex.source, "file");
+			assert.equal(ex.result.summary, "from file");
+		}
 	});
 
 	it("normalizeJobResult repairs malformed fields", () => {

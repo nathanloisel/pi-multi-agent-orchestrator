@@ -15,10 +15,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BudgetManager } from "./budget.ts";
 import { ConcurrencyManager } from "./concurrency.ts";
+import { MessageBroker, type AttentionItem, type HumanQuestionHandler, type InboxItem } from "./broker.ts";
 import { EventLog, type EventType } from "./events.ts";
 import { OrchestratorError } from "./errors.ts";
 import { ModelRegistry, type LaunchConfig } from "./models.ts";
-import { renderDependencySection, renderEnvelope, type EnvelopeInput } from "./prompts.ts";
+import { renderDependencySection, renderEnvelope, resultDeliveryFor, type EnvelopeInput } from "./prompts.ts";
 import { extractResult, persistAttemptResult, renderReportMd, resultSummaryForOrchestrator } from "./result.ts";
 import { Router, type RoutingDecision } from "./routing.ts";
 import { runWorker, type SpawnOutcome, type SpawnRequest } from "./spawn.ts";
@@ -132,11 +133,17 @@ export interface RunReport {
 export class Orchestrator {
 	readonly store: JobStore;
 	readonly events: EventLog;
+	/** Parent-side live messaging broker (phase 2): jobs message/inbox/reply + attention. */
+	readonly broker: MessageBroker;
 	private cancels = new Map<string, AbortController>();
 
 	constructor(public config: OrchestratorConfig) {
 		this.store = config.store;
 		this.events = config.events;
+		this.broker = new MessageBroker(config.events);
+		// Fires only for provably dead or unrecorded owners: recoverInterrupted()
+		// protects attempts whose ownerPid liveness cannot be disproved, so this
+		// reason stays accurate for every emitted job.interrupted event.
 		this.store.setRecoveryHandler((job, attempt) => {
 			this.events.append(job.jobId, "job.interrupted", { reason: "orchestrator_process_terminated" }, attempt.attemptId);
 		});
@@ -282,10 +289,64 @@ export class Orchestrator {
 		return true;
 	}
 
+	// ── Live messaging (phase 2: broker surface) ────────────────────────────────
+
+	/**
+	 * Send a one-way main→worker message by steering the job's LIVE worker.
+	 * Resolves only after the worker ACKs the steer (no delivery claim before
+	 * that); throws explicit errors for unknown jobs, jobs that are not
+	 * running, and workers that refuse the steer.
+	 *
+	 * Reads raw store state on purpose: crash-recovery reads would falsely mark
+	 * a legitimately RUNNING attempt interrupted here.
+	 */
+	async messageJob(jobId: string, text: string): Promise<void> {
+		const job = this.store.readJob(jobId);
+		if (!job) throw new OrchestratorError("unknown", `Unknown job ${jobId}`);
+		if (statusIsTerminal(job.status)) {
+			throw new OrchestratorError("unknown", `Job ${jobId} is ${job.status}; only running jobs have a live worker to message`);
+		}
+		if (job.status !== "running") {
+			throw new OrchestratorError("unknown", `Job ${jobId} is ${job.status}, not running — there is no live worker to message. Use delegate or jobs followup instead.`);
+		}
+		await this.broker.steerJob(jobId, text);
+	}
+
+	/**
+	 * Read the bounded message/request inbox (optionally one job). Reading
+	 * consumes attention: surfaced items never re-yield a blocking call.
+	 */
+	inbox(jobId?: string): InboxItem[] {
+		return this.broker.readInbox(jobId);
+	}
+
+	/** Answer a pending ask_main request (exact correlation; rejects duplicates/expired/cross-job). */
+	reply(jobId: string, requestId: string, answer: string): void {
+		this.broker.reply(jobId, requestId, answer);
+	}
+
+	/** Subscribe to NEW worker attention (unconsumed messages + ask_main requests). */
+	onAttention(listener: (attention: AttentionItem) => void): () => void {
+		return this.broker.onAttention(listener);
+	}
+
+	/** Register the human-question seam for worker-routed ask_user_question. */
+	setHumanQuestionHandler(handler: HumanQuestionHandler | undefined): void {
+		this.broker.setHumanQuestionHandler(handler);
+	}
+
+	/** A worker is live for this job (spawned child not yet exited). */
+	hasLiveWorker(jobId: string): boolean {
+		return this.broker.hasActiveChild(jobId);
+	}
+
 	// ── Running ──────────────────────────────────────────────────────────────
 
 	/** Follow-up: resume the job's latest attempt session (cheapest channel). */
 	async followupJob(jobId: string, message: string, agents: AgentConfig[], signal?: AbortSignal): Promise<RunReport> {
+		// Guard BEFORE any crash-recovery read: a live worker must never be
+		// falsely marked interrupted by recoverInterrupted().
+		this.assertNoLiveWorker(jobId, "follow-up");
 		const job = this.requireJob(jobId);
 		const lastAttempt = job.latestAttemptId ? this.store.readAttempt(jobId, job.latestAttemptId) : null;
 		if (!lastAttempt) throw new OrchestratorError("unknown", `Job ${jobId} has no attempts to follow up`);
@@ -316,6 +377,8 @@ export class Orchestrator {
 		agents: AgentConfig[],
 		opts: { strategy?: "resume" | "fresh"; model?: string; reason?: string; signal?: AbortSignal } = {},
 	): Promise<RunReport> {
+		// Guard BEFORE any crash-recovery read (see followupJob).
+		this.assertNoLiveWorker(jobId, "retry");
 		const job = this.requireJob(jobId);
 		if (job.status === "running") throw new OrchestratorError("unknown", `Job ${jobId} is running; cancel or wait first`);
 		job.status = "ready";
@@ -343,12 +406,45 @@ export class Orchestrator {
 	 * satisfied; independent jobs execute concurrently under the concurrency
 	 * gates. Failed/cancelled dependencies propagate "failed" downstream.
 	 *
-	 * onJobUpdate fires once per job as it settles — even inside a parallel
-	 * batch — so callers can stream partial tool results. Observer exceptions
-	 * are isolated and never affect job outcomes.
+	 * Incremental scheduling: the ready set is re-evaluated after EVERY job
+	 * completion instead of waiting for a whole ready wave (Promise.allSettled)
+	 * to drain. Each eligible job is enqueued exactly once (`launched`), so a
+	 * fast predecessor releases its dependents while unrelated slow jobs are
+	 * still in flight, and outstanding work is always drained before returning.
+	 * Admission is bounded by the global concurrency limit: jobs beyond that
+	 * wait for a completion (which triggers a ready-set re-evaluation anyway),
+	 * while the per-model attempt gates keep applying inside executeAttempt.
+	 *
+	 * onJobUpdate fires once per job as it settles — even while other jobs are
+	 * still running — so callers can stream partial tool results. Observer
+	 * exceptions are isolated and never affect job outcomes.
 	 */
 	async runGraph(agents: AgentConfig[], opts: { signal?: AbortSignal; jobIds?: string[]; onJobUpdate?: (report: RunReport) => void } = {}): Promise<RunReport[]> {
+		type Settled = { jobId: string; report?: RunReport; error?: unknown };
 		const reports: RunReport[] = [];
+		// Jobs already handed to runJobInternal exactly once — the ready set may be
+		// re-evaluated many times while a job is still queued at a concurrency gate
+		// (its status stays "ready"), and it must never be enqueued twice.
+		const launched = new Set<string>();
+		const inFlight = new Map<string, Promise<Settled>>();
+		const notify = (report: RunReport) => {
+			if (!opts.onJobUpdate) return;
+			try {
+				opts.onJobUpdate(report);
+			} catch {
+				/* progress observers must never affect job outcomes */
+			}
+		};
+		/** Await ANY in-flight completion and consume it (report + observer). */
+		const drainOne = async (): Promise<void> => {
+			const settled = await Promise.race(inFlight.values());
+			inFlight.delete(settled.jobId);
+			if (settled.report) {
+				reports.push(settled.report);
+				notify(settled.report);
+			}
+			// rejected entries are dropped, matching Promise.allSettled semantics
+		};
 		for (;;) {
 			const jobs = this.store.listJobs().map((j) => this.store.recoverInterrupted(j));
 			const byId = new Map(jobs.map((j) => [j.jobId, j]));
@@ -385,6 +481,7 @@ export class Orchestrator {
 				// Scoped runs execute only the requested subgraph + transitively
 				// pulled-in dependencies; unscoped runs execute everything ready.
 				if (scope && !scope.has(j.jobId)) return false;
+				if (launched.has(j.jobId)) return false; // enqueue each job exactly once
 				if (statusIsTerminal(j.status) || j.status === "running" || j.status === "interrupted") return false;
 				return effectiveStatus(j, byId) === "ready";
 			});
@@ -411,44 +508,41 @@ export class Orchestrator {
 			}
 			// dependency-gated failures never execute an attempt, but they ARE
 			// transitions: report them so partial results stay truthful.
-			if (opts.onJobUpdate) {
-				for (const j of propagated) {
-					try {
-						opts.onJobUpdate(this.derivedReport(j));
-					} catch {
-						/* progress observers must never affect job outcomes */
-					}
-				}
-			}
-			if (runnable.length === 0) {
-				// nothing to execute; loop only if propagation changed state so its
-				// own downstream effects are resolved (then terminate)
-				if (propagated.length === 0) break;
-				continue;
-			}
+			for (const j of propagated) notify(this.derivedReport(j));
 
-			const batch = await Promise.allSettled(
-				runnable.map(async (job) => {
-					const controller = new AbortController();
-					this.cancels.set(job.jobId, controller);
-					const combined = combineSignals(controller.signal, opts.signal);
-					try {
-						const report = await this.runJobInternal(job, agents, { signal: combined });
-						if (opts.onJobUpdate) {
-							try {
-								opts.onJobUpdate(report);
-							} catch {
-								/* progress observers must never affect job outcomes */
-							}
+			// Propagation is progress (its own downstream effects must be resolved);
+			// launching is progress (new work is outstanding). Otherwise wait for ANY
+			// in-flight completion — or terminate when nothing is outstanding.
+			let progress = propagated.length > 0;
+			// A cancelled run drains what is already in flight but enqueues nothing new.
+			if (runnable.length > 0 && !opts.signal?.aborted) {
+				// Admission control: never hold more jobs in flight than the global
+				// concurrency gate can admit; the rest wait for a completion (the
+				// ready set is re-evaluated then anyway). Per-model gates still apply
+				// per attempt inside executeAttempt.
+				const capacity = Math.max(0, this.config.concurrency.stats().global.limit - inFlight.size);
+				const batch = runnable.slice(0, capacity);
+				for (const job of batch) {
+					launched.add(job.jobId);
+					const run: Promise<Settled> = (async (): Promise<Settled> => {
+						const controller = new AbortController();
+						this.cancels.set(job.jobId, controller);
+						const combined = combineSignals(controller.signal, opts.signal);
+						try {
+							return { jobId: job.jobId, report: await this.runJobInternal(job, agents, { signal: combined }) };
+						} catch (error) {
+							return { jobId: job.jobId, error };
+						} finally {
+							this.cancels.delete(job.jobId);
 						}
-						return report;
-					} finally {
-						this.cancels.delete(job.jobId);
-					}
-				}),
-			);
-			for (const r of batch) {
-				if (r.status === "fulfilled") reports.push(r.value);
+					})();
+					inFlight.set(job.jobId, run);
+				}
+				if (batch.length > 0) progress = true;
+			}
+			if (!progress) {
+				if (inFlight.size === 0) break; // everything settled and nothing ready
+				await drainOne();
 			}
 		}
 		return reports;
@@ -498,6 +592,17 @@ export class Orchestrator {
 		return job;
 	}
 
+	/** Guard against concurrent attempts while an existing child is active:
+	 * live messaging (jobs message/reply) is the supported channel instead. */
+	private assertNoLiveWorker(jobId: string, action: string): void {
+		if (!this.broker.hasActiveChild(jobId)) return;
+		const child = this.broker.activeChild(jobId);
+		throw new OrchestratorError(
+			"unknown",
+			`Job ${jobId} already has a live worker${child ? ` (attempt ${child.attemptId})` : ""}; use jobs message/reply to interact with it instead of ${action} while it runs`,
+		);
+	}
+
 	/** Full ladder loop: attempts until success / exhaustion / budget / cancel. */
 	private async runJobInternal(
 		job: JobRecord,
@@ -505,6 +610,7 @@ export class Orchestrator {
 		opts: { explicitModel?: string; explicitStrategy?: "resume" | "fresh"; escalationReason?: string; signal?: AbortSignal; maxAttemptsThisRun?: number } = {},
 	): Promise<RunReport> {
 		const agent = this.agentByName(agents, job.agent);
+		this.assertNoLiveWorker(job.jobId, "a new run");
 		const attemptsSoFar = this.store.listAttempts(job.jobId);
 		// Automatic runs are capped by the job's lifetime maxAttempts; explicit
 		// manual retries get their own bounded run budget (the caller decides).
@@ -547,7 +653,8 @@ export class Orchestrator {
 			const last = report.attempts[report.attempts.length - 1];
 			if (report.status === "success") break;
 			if (last?.exitReason === "aborted") {
-				this.failJob(job, "aborted");
+				// jobs cancel / user abort: the gated run already persisted the
+				// CANCELLED attempt and job state — never overwrite it with failed.
 				break;
 			}
 			if (last?.exitReason === "budget_exceeded") {
@@ -631,6 +738,29 @@ export class Orchestrator {
 	}
 
 	private async runAttemptGated(
+		job: JobRecord,
+		agent: AgentConfig,
+		decision: RoutingDecision,
+		attemptNumber: number,
+		previousAttempts: AttemptRecord[],
+		opts: { resumeAttempt?: AttemptRecord; taskOverride?: string; escalationReason?: string; manual?: boolean; signal?: AbortSignal },
+	): Promise<RunReport> {
+		const store = this.store;
+		// Cancel ownership: every in-flight attempt registers an AbortController so
+		// jobs cancel (and session teardown) can abort the live worker, whether
+		// the run is awaited by a tool or continuing in the background after a
+		// messaging yield. The tool's own signal is combined in below.
+		const cancelController = new AbortController();
+		this.cancels.set(job.jobId, cancelController);
+		const runSignal = combineSignals(cancelController.signal, opts.signal);
+		try {
+			return await this.runAttemptGatedInner(job, agent, decision, attemptNumber, previousAttempts, { ...opts, signal: runSignal });
+		} finally {
+			if (this.cancels.get(job.jobId) === cancelController) this.cancels.delete(job.jobId);
+		}
+	}
+
+	private async runAttemptGatedInner(
 		job: JobRecord,
 		agent: AgentConfig,
 		decision: RoutingDecision,
@@ -743,7 +873,7 @@ export class Orchestrator {
 		const legUsage: UsageInfo = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, contextTokens: 0, turns: 0 };
 		for (let t = 0; ; t++) {
 			this.events.append(job.jobId, "provider.requested", { provider: decision.resolved.concrete.provider, model: decision.resolved.concrete.model }, attemptId);
-			const spawnReq = {
+			const spawnReq: SpawnRequest = {
 				agent,
 				resolved: decision.resolved,
 				prompt: envelope,
@@ -758,6 +888,15 @@ export class Orchestrator {
 				signal: opts.signal,
 				launchArgs: launch.args,
 				launchEnv: launch.env,
+				// Live messaging hooks (phase 2 broker): worker messages, blocking
+				// requests, and the steering control are broker-owned. Hook-driven
+				// work is asynchronous and never blocks the stdout event loop.
+				onMessage: (message) => this.broker.handleWorkerMessage(job.jobId, attemptId, message),
+				onRequest: (request, rpc) => this.broker.handleWorkerRequest(job.jobId, attemptId, agent.name, request, rpc),
+				onControl: (control) => {
+					if (control) this.broker.attachChild(job.jobId, attemptId, control);
+					else this.broker.detachChild(job.jobId, attemptId);
+				},
 			};
 			outcome = this.config.workerRunner
 				? await this.config.workerRunner(spawnReq)
@@ -775,7 +914,7 @@ export class Orchestrator {
 		}
 
 		// ── result extraction + deterministic validation (§4, §15)
-		const extracted = extractResult({ attemptDir, finalText: outcome.finalText, jobId: job.jobId, attemptId });
+		const extracted = extractResult({ attemptDir, finalText: outcome.finalText, jobId: job.jobId, attemptId, delivery: resultDeliveryFor(agent) });
 		// Canonical status precedence (§4): a terminal runError is authoritative.
 		// If the transport-retry loop ENDED with a run failure, a worker-written
 		// success result must never surface as canonical success. Findings/changes/
