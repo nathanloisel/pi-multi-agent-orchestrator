@@ -52,6 +52,13 @@ export interface SpawnRequest {
 	timeoutSeconds: number;
 	signal?: AbortSignal;
 	onUpdate?: (u: { finalText: string; turns: number }) => void;
+	/**
+	 * Already-parsed RPC event observer (bounded transcript feed): called for
+	 * every valid JSON event line right after the raw-line capture, with the raw
+	 * parsed event object. Observer exceptions are swallowed and never affect
+	 * the run, result extraction, or the messaging transport.
+	 */
+	onEvent?: (event: { type: string; [key: string]: unknown }) => void;
 	/** pi CLI arg overrides (e.g. --session-dir reuse handled internally). */
 	extraArgs?: string[];
 	launchArgs: string[]; // --model/--thinking/etc. from ModelRegistry.toLaunchConfig
@@ -403,6 +410,13 @@ export async function runWorker(req: SpawnRequest): Promise<SpawnOutcome> {
 			}
 			if (!parsed || typeof parsed !== "object") return;
 			capture.append(line); // raw valid event line; best-effort bounded capture
+			if (req.onEvent) {
+				try {
+					req.onEvent(parsed as { type: string; [key: string]: unknown });
+				} catch {
+					/* observer isolation: drop, stdout parsing continues */
+				}
+			}
 			const event = parsed as { type?: unknown; sessionId?: unknown; message?: unknown; id?: unknown; success?: unknown; error?: unknown };
 			if (event.type === "session_start" && typeof event.sessionId === "string") sessionId = event.sessionId;
 			if (event.type === "message_end" && event.message && typeof event.message === "object") {

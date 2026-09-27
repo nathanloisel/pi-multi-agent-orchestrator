@@ -23,6 +23,7 @@ import { renderDependencySection, renderEnvelope, resultDeliveryFor, type Envelo
 import { extractResult, persistAttemptResult, renderReportMd, resultSummaryForOrchestrator } from "./result.ts";
 import { Router, type RoutingDecision } from "./routing.ts";
 import { runWorker, type SpawnOutcome, type SpawnRequest } from "./spawn.ts";
+import { WorkerFeed } from "./worker-feed.ts";
 import { atomicWriteJson, atomicWriteText, JobStore, readJson, statusIsTerminal } from "./storage.ts";
 import { buildContextPack, type BuildContextOpts } from "./context.ts";
 import { runValidation, validationFeedback } from "./validation.ts";
@@ -135,6 +136,8 @@ export class Orchestrator {
 	readonly events: EventLog;
 	/** Parent-side live messaging broker (phase 2): jobs message/inbox/reply + attention. */
 	readonly broker: MessageBroker;
+	/** Bounded event-driven transcript feed for the /workers dashboard (core/worker-feed.ts). */
+	readonly workerFeed: WorkerFeed = new WorkerFeed();
 	private cancels = new Map<string, AbortController>();
 
 	constructor(public config: OrchestratorConfig) {
@@ -871,46 +874,54 @@ export class Orchestrator {
 		// retries included); contextTokens keeps the max high-water mark so a final
 		// zero-usage leg can never erase earlier spend.
 		const legUsage: UsageInfo = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, contextTokens: 0, turns: 0 };
-		for (let t = 0; ; t++) {
-			this.events.append(job.jobId, "provider.requested", { provider: decision.resolved.concrete.provider, model: decision.resolved.concrete.model }, attemptId);
-			const spawnReq: SpawnRequest = {
-				agent,
-				resolved: decision.resolved,
-				prompt: envelope,
-				cwd: workspace.path,
-				jobId: job.jobId,
-				attemptId,
-				attemptDir,
-				sessionDir,
-				sessionId: `${job.jobId}-${attemptId}`,
-				workerExtensionPath: this.config.workerExtensionPath,
-				timeoutSeconds: agent.limits.timeoutSeconds ?? 1800,
-				signal: opts.signal,
-				launchArgs: launch.args,
-				launchEnv: launch.env,
-				// Live messaging hooks (phase 2 broker): worker messages, blocking
-				// requests, and the steering control are broker-owned. Hook-driven
-				// work is asynchronous and never blocks the stdout event loop.
-				onMessage: (message) => this.broker.handleWorkerMessage(job.jobId, attemptId, message),
-				onRequest: (request, rpc) => this.broker.handleWorkerRequest(job.jobId, attemptId, agent.name, request, rpc),
-				onControl: (control) => {
-					if (control) this.broker.attachChild(job.jobId, attemptId, control);
-					else this.broker.detachChild(job.jobId, attemptId);
-				},
-			};
-			outcome = this.config.workerRunner
-				? await this.config.workerRunner(spawnReq)
-				: await runWorker(spawnReq);
-			accumulateUsage(legUsage, outcome.usage);
-			this.events.append(job.jobId, "provider.completed", { exitCode: outcome.exitCode, turns: outcome.usage.turns, costUsd: outcome.usage.costUsd }, attemptId);
-			if (outcome.runError?.isTransport && t < maxTransportRetries && !opts.signal?.aborted) {
-				this.events.append(job.jobId, "attempt.transport_retry", { n: t + 1, kind: outcome.runError.kind, message: outcome.runError.message }, attemptId);
-				attempt.transportRetries = t + 1;
-				store.writeAttempt(attempt);
-				await sleep(1000 * 2 ** t, opts.signal);
-				continue;
+		this.workerFeed.beginAttempt(job.jobId, attemptId);
+		try {
+			for (let t = 0; ; t++) {
+				this.events.append(job.jobId, "provider.requested", { provider: decision.resolved.concrete.provider, model: decision.resolved.concrete.model }, attemptId);
+				const spawnReq: SpawnRequest = {
+					agent,
+					resolved: decision.resolved,
+					prompt: envelope,
+					cwd: workspace.path,
+					jobId: job.jobId,
+					attemptId,
+					attemptDir,
+					sessionDir,
+					sessionId: `${job.jobId}-${attemptId}`,
+					workerExtensionPath: this.config.workerExtensionPath,
+					timeoutSeconds: agent.limits.timeoutSeconds ?? 1800,
+					signal: opts.signal,
+					launchArgs: launch.args,
+					launchEnv: launch.env,
+					// Bounded transcript feed: already-parsed raw events with the
+					// trusted job/attempt ids captured by this closure.
+					onEvent: (event) => this.workerFeed.ingest(job.jobId, attemptId, event),
+					// Live messaging hooks (phase 2 broker): worker messages, blocking
+					// requests, and the steering control are broker-owned. Hook-driven
+					// work is asynchronous and never blocks the stdout event loop.
+					onMessage: (message) => this.broker.handleWorkerMessage(job.jobId, attemptId, message),
+					onRequest: (request, rpc) => this.broker.handleWorkerRequest(job.jobId, attemptId, agent.name, request, rpc),
+					onControl: (control) => {
+						if (control) this.broker.attachChild(job.jobId, attemptId, control);
+						else this.broker.detachChild(job.jobId, attemptId);
+					},
+				};
+				outcome = this.config.workerRunner
+					? await this.config.workerRunner(spawnReq)
+					: await runWorker(spawnReq);
+				accumulateUsage(legUsage, outcome.usage);
+				this.events.append(job.jobId, "provider.completed", { exitCode: outcome.exitCode, turns: outcome.usage.turns, costUsd: outcome.usage.costUsd }, attemptId);
+				if (outcome.runError?.isTransport && t < maxTransportRetries && !opts.signal?.aborted) {
+					this.events.append(job.jobId, "attempt.transport_retry", { n: t + 1, kind: outcome.runError.kind, message: outcome.runError.message }, attemptId);
+					attempt.transportRetries = t + 1;
+					store.writeAttempt(attempt);
+					await sleep(1000 * 2 ** t, opts.signal);
+					continue;
+				}
+				break;
 			}
-			break;
+		} finally {
+			this.workerFeed.finishAttempt(job.jobId, attemptId);
 		}
 
 		// ── result extraction + deterministic validation (§4, §15)
