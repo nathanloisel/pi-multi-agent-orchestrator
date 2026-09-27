@@ -291,3 +291,38 @@ lifecycle; nothing here spawns shells or multiplexers:
   main lockdown. Headless/no-UI sessions return `unavailable` immediately.
 - Job status stays `running` while a worker waits; DAG dependents await the
   actual result.
+
+## 14. Workers dashboard (`/workers`, main session)
+
+The dashboard rides the existing broker/feed seams — no new transport, no
+worker execution change:
+
+- **Transcript feed** (`core/worker-feed.ts`, `Orchestrator.workerFeed`):
+  bounded, event-driven capture of live worker output built from the
+  already-parsed RPC events of `SpawnRequest.onEvent` (no stream.jsonl replay).
+  Latest-attempt view, streamed-delta de-dup against `message_end`, bounded
+  tool lifecycle summaries, thinking omitted. Hard caps: 200 entries / 64 KiB
+  text per job and 48 job buffers (LRU with truthful tombstones); snapshots are
+  cached per revision. `appendPrompt(jobId, text)` records a human prompt ONLY
+  after the `messageJob` steer ACK. The feed is disposed when its orchestrator
+  runtime is destroyed (never merely when the dashboard closes); captures while
+  closed stay bounded.
+- **Backend adapter** (index.ts, `WorkerDashboardBackend`): caches job metadata
+  on dashboard open and refreshes it only on status-changing runtime events via
+  raw single-job store reads — never `listJobs`/filesystem scans from render or
+  per-delta paths. Feed deltas only request a coalesced redraw (≤33 ms flush).
+  `canSend` requires a genuinely live active job (`hasLiveWorker` + `running`
+  cached status; finished/waiting/stale ids reject). `send()` awaits
+  `messageJob` — the final guard — and resolves success only after the worker
+  ACKs; failures preserve the UI draft and never claim agent-work completion.
+- **UI** (`workers-dashboard.ts`): one top-level bounded overlay, main TUI
+  only (installed `ctx.mode` guard — `hasUI` alone does not exclude RPC; no
+  headless `ctx.ui.custom()` calls). Width-100% grid with adaptive column wrap
+  and row pagination, per-pane ACK-gated prompt inputs, Ctrl+O picker,
+  Ctrl+W close pane, Tab/Shift+Tab focus, PgUp/PgDn scroll, End follow, Enter
+  send, Esc close. Duplicate `/workers` focuses the open dashboard — never a
+  leaked duplicate controller. The `ask_user_question` FIFO queue is unchanged
+  and returns dashboard focus when a question closes. Close (Esc),
+  `session_shutdown`, `session_tree`, and runtime replacement tear the
+  controller down idempotently (unsubscribe feed/event listeners, cancel
+  pending render tasks, close the overlay once).

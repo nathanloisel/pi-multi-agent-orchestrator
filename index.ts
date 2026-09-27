@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type OverlayHandle } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import { parse as yamlParse } from "yaml";
@@ -45,6 +45,8 @@ import type { AttentionItem, HumanQuestionHandler, InboxItem, InboxRequest, Rout
 import type { WorkerReply } from "./core/messaging.ts";
 import { askUserQuestion, disposeQuestionUi } from "./ask-user.ts";
 import { Orchestrator, type CreateJobInput, type RunReport } from "./core/orchestrator.ts";
+import { createWorkersDashboard, type DashboardTheme, type WorkersDashboardHandle } from "./workers-dashboard.ts";
+import type { DashboardJob, DashboardSnapshot, WorkerDashboardBackend } from "./workers-dashboard-model.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "./core/telemetry.ts";
 import { scaffoldOrchestratorFiles } from "./core/scaffold.ts";
 import {
@@ -70,8 +72,162 @@ const MAX_PARALLEL_TASKS = 16;
 const SUMMARY_CAP = 4 * 1024;
 const PROGRESS_WIDGET_ID = "orchestrator-progress";
 const PROGRESS_STATUS_KEY = "orchestrator";
+/** Bounded /workers dashboard metadata cache (mirrors the feed's job-buffer cap). */
+const WORKERS_METADATA_CAP = 48;
+/** Vertical overlay margin; host.getHeight() reports usable rows minus both margins. */
+const WORKERS_OVERLAY_MARGIN = 1;
 
 const HERE = typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+
+// ── /workers dashboard backend (cached adapter over the live runtime) ───────
+//
+// Metadata is cached once on dashboard open and refreshed ONLY on
+// status-changing runtime events via raw single-job store reads; worker-feed
+// deltas just request a coalesced redraw. list()/read() are pure in-memory
+// reads — no filesystem work ever happens from render or per-delta paths.
+// The cache is LRU-bounded so many unique jobs can never grow it unbounded.
+
+/** Runtime events that can change job status (the only metadata refresh trigger). */
+const WORKERS_STATUS_EVENTS: ReadonlySet<string> = new Set([
+	"job.created",
+	"job.ready",
+	"job.blocked",
+	"job.started",
+	"job.escalated",
+	"job.completed",
+	"job.failed",
+	"job.cancelled",
+	"job.interrupted",
+	"attempt.started",
+	"attempt.completed",
+	"attempt.failed",
+]);
+
+function workersTitleOf(job: JobRecord): string {
+	const text = (job.lastSummary ?? job.objective ?? "").split("\n")[0]!.trim();
+	return (text || job.jobId).slice(0, 120);
+}
+
+class WorkersFeedBackend implements WorkerDashboardBackend {
+	/** Insertion-ordered metadata cache, LRU-evicted at WORKERS_METADATA_CAP. */
+	private readonly meta = new Map<string, DashboardJob>();
+	private readonly listeners = new Set<() => void>();
+	private detachFeed: (() => void) | null = null;
+	private detachEvents: (() => void) | null = null;
+	private disposed = false;
+
+	constructor(private readonly runtime: Orchestrator) {
+		// One metadata scan on dashboard open; per-job raw reads afterwards.
+		const jobs = this.runtime.store.listJobs().slice().sort((a, b) => b.updatedAt - a.updatedAt);
+		for (const job of jobs) this.cache(job);
+	}
+
+	private cache(job: JobRecord): void {
+		this.meta.delete(job.jobId);
+		this.meta.set(job.jobId, {
+			id: job.jobId,
+			title: workersTitleOf(job),
+			status: job.status,
+			agent: job.agent,
+			model: job.initialModel,
+			attemptId: job.latestAttemptId,
+			canSend: this.canSend(job.jobId, job.status),
+		});
+		while (this.meta.size > WORKERS_METADATA_CAP) {
+			const oldest = this.meta.keys().next();
+			if (oldest.done) break;
+			this.meta.delete(oldest.value);
+		}
+	}
+
+	/** In-memory liveness gate: genuinely live active jobs only (messageJob re-checks). */
+	private canSend(jobId: string, status: string): boolean {
+		return status === "running" && this.runtime.hasLiveWorker(jobId);
+	}
+
+	list(): DashboardJob[] {
+		const jobs: DashboardJob[] = [];
+		for (const job of this.meta.values()) {
+			// canSend is live in-memory state; cheap recompute, never a store read.
+			jobs.push({ ...job, canSend: this.canSend(job.id, job.status) });
+		}
+		return jobs.reverse(); // most recently updated first
+	}
+
+	read(jobId: string): DashboardSnapshot {
+		// In-memory cached feed snapshots (revisions); unknown ids stay cheap.
+		return this.runtime.workerFeed.read(jobId);
+	}
+
+	subscribe(listener: () => void): () => void {
+		if (this.disposed) return () => {};
+		this.listeners.add(listener);
+		if (!this.detachFeed) {
+			// Feed deltas request a coalesced redraw only — never a metadata refresh.
+			this.detachFeed = this.runtime.workerFeed.subscribe(() => this.emit());
+		}
+		if (!this.detachEvents) {
+			// Status changes only: one raw store read per transition, never a scan.
+			this.detachEvents = this.runtime.events.onEvent((event) => {
+				if (!WORKERS_STATUS_EVENTS.has(event.type)) return;
+				try {
+					const job = this.runtime.store.readJob(event.jobId); // raw; no recovery
+					if (job) this.cache(job);
+				} catch {
+					/* observer isolation: UI state never affects jobs */
+				}
+				this.emit();
+			});
+		}
+		let active = true;
+		return () => {
+			if (!active) return;
+			active = false;
+			this.listeners.delete(listener);
+			if (this.listeners.size === 0) {
+				this.detachFeed?.();
+				this.detachFeed = null;
+				this.detachEvents?.();
+				this.detachEvents = null;
+			}
+		};
+	}
+
+	async send(jobId: string, text: string): Promise<void> {
+		// messageJob is the final guard (unknown/terminal/waiting/no live worker)
+		// and resolves ONLY on the worker's steer ACK; the prompt is recorded as
+		// delivered only then. The ACK says nothing about agent work completion.
+		await this.runtime.messageJob(jobId, text);
+		this.runtime.workerFeed.appendPrompt(jobId, text);
+	}
+
+	private emit(): void {
+		for (const listener of [...this.listeners]) {
+			try {
+				listener();
+			} catch {
+				/* observer isolation */
+			}
+		}
+	}
+
+	/** Explicit teardown: drop feed/event listeners even without a subscriber. */
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.listeners.clear();
+		this.detachFeed?.();
+		this.detachFeed = null;
+		this.detachEvents?.();
+		this.detachEvents = null;
+	}
+}
+
+/** Live /workers dashboard controller (at most one per session). */
+interface WorkersDashboardController {
+	overlay: OverlayHandle | null;
+	close(): void;
+}
 
 function cap(text: string, bytes = SUMMARY_CAP): string {
 	return Buffer.byteLength(text) <= bytes ? text : `${text.slice(0, bytes)}\n[… truncated — full details via jobs.read / jobs.artifact]`;
@@ -502,7 +658,7 @@ export default function (pi: ExtensionAPI) {
 				timeoutSeconds: routed.request.timeoutSeconds,
 			},
 			{ identity, signal: rpc.signal },
-		);
+		).finally(restoreWorkersDashboardFocus);
 		switch (out.status) {
 			case "answered":
 				return { status: "answered", answer: out.answer };
@@ -536,9 +692,26 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			/* best effort */
 		}
+		// The feed is owned by its runtime: destroyed with it, not with the dashboard.
+		try {
+			orch?.workerFeed.dispose();
+		} catch {
+			/* best effort */
+		}
 	}
 
 	function buildRuntime(cwd: string, sessionModel?: { provider?: string; model?: string; effort?: string }) {
+		// Runtime replacement: close the dashboard bound to the old runtime and
+		// destroy that runtime's worker feed (captures survive only while bounded).
+		workersDashboard?.close();
+		workersDashboard = null;
+		if (orch) {
+			try {
+				orch.workerFeed.dispose();
+			} catch {
+				/* best effort */
+			}
+		}
 		const discovery = discoverAgents(cwd, { includeProject: false });
 		agents = discovery.agents;
 		mainAgent = discovery.main;
@@ -595,6 +768,18 @@ export default function (pi: ExtensionAPI) {
 					console.error(`[orchestrator] failed to load main hook ${hookPath}:`, err);
 				}
 			}
+		}
+	}
+
+	// ── /workers dashboard state (single controller per session) ────────────
+	let workersDashboard: WorkersDashboardController | null = null;
+
+	/** Restore /workers dashboard focus after an ask-user-question overlay closes. */
+	function restoreWorkersDashboardFocus(): void {
+		try {
+			workersDashboard?.overlay?.focus();
+		} catch {
+			/* best effort */
 		}
 	}
 
@@ -658,6 +843,10 @@ export default function (pi: ExtensionAPI) {
 
 	// Clear progress UI + observers on teardown (quit, /reload, session swap).
 	pi.on("session_shutdown", async (_event, ctx) => {
+		// Guard dashboard cleanup: close the overlay idempotently, unsubscribe
+		// feed/event listeners, cancel pending render tasks.
+		workersDashboard?.close();
+		workersDashboard = null;
 		resetProgress();
 		teardownLiveMessaging();
 		uiCtx = null;
@@ -671,6 +860,9 @@ export default function (pi: ExtensionAPI) {
 
 	// Branch navigation: re-project from the NEW branch's membership entries.
 	pi.on("session_tree", async (_event, ctx) => {
+		// Jobs are branch-scoped: a dashboard bound to the old branch closes here.
+		workersDashboard?.close();
+		workersDashboard = null;
 		resetProgress();
 		uiCtx = ctx;
 		clearProgressWidget(ctx);
@@ -1253,7 +1445,7 @@ export default function (pi: ExtensionAPI) {
 					timeoutSeconds: params.timeoutSeconds,
 				},
 				{ signal },
-			);
+			).finally(restoreWorkersDashboardFocus);
 			switch (out.status) {
 				case "answered":
 					return {
@@ -1339,6 +1531,121 @@ export default function (pi: ExtensionAPI) {
 				].join("\n"),
 				"info",
 			);
+		},
+	});
+
+	// ── /workers command: main-session worker dashboard overlay ─────────────
+	pi.registerCommand("workers", {
+		description: "Open the /workers dashboard: live worker panes with direct ACK-gated prompts (/workers [jobId ...])",
+		handler: async (args, ctx) => {
+			// Main-session TUI only: ctx.ui.custom() overlays are terminal-only UI.
+			// hasUI alone does NOT exclude RPC mode — the installed context mode
+			// guard does; never call custom() headless.
+			if (!ctx || ctx.hasUI === false || ctx.mode !== "tui") {
+				try {
+					ctx?.ui.notify(`workers dashboard requires the interactive TUI (mode: ${ctx?.mode ?? "none"}); unavailable here`, "warning");
+				} catch {
+					/* best effort */
+				}
+				return;
+			}
+			if (workersDashboard) {
+				// Never create a leaked duplicate controller: focus the open one.
+				try {
+					ctx.ui.notify("workers dashboard is already open — focusing it", "info");
+					workersDashboard.overlay?.focus();
+				} catch {
+					/* best effort */
+				}
+				return;
+			}
+			const o = requireOrch(ctx.cwd, ctx.model ? { provider: ctx.model.provider, model: ctx.model.id, effort: ctx.thinkingLevel } : undefined);
+			const backend = new WorkersFeedBackend(o);
+			// Initial ids are validated up front with clear feedback for the rest.
+			const requested = args.trim().split(/\s+/).filter(Boolean);
+			const known = new Set(backend.list().map((job) => job.id));
+			const seen = new Set<string>();
+			const valid: string[] = [];
+			const unknown: string[] = [];
+			for (const id of requested) {
+				if (seen.has(id)) continue;
+				seen.add(id);
+				if (known.has(id)) valid.push(id);
+				else unknown.push(id);
+			}
+			if (unknown.length > 0) {
+				ctx.ui.notify(`workers: unknown job id(s) ignored: ${unknown.join(", ")} — pick more with Ctrl+O`, "warning");
+			}
+			if (requested.length > 0 && valid.length === 0) {
+				ctx.ui.notify("workers: no recognized job ids — opening the default live-worker selection", "warning");
+			}
+			const initialJobIds = requested.length > 0 ? valid : undefined;
+			let component: WorkersDashboardHandle | null = null;
+			let doneFn: (() => void) | null = null;
+			let closed = false;
+			const finish = (): void => {
+				if (closed) return;
+				closed = true;
+				if (workersDashboard === controller) workersDashboard = null;
+				try {
+					component?.dispose(); // cancels pending render tasks + unsubscribes
+				} catch {
+					/* best effort */
+				}
+				try {
+					backend.dispose(); // drop feed/event listeners explicitly
+				} catch {
+					/* best effort */
+				}
+				// done() resolves the custom promise and closes the overlay;
+				// hide() sweeps our entry even if another overlay stacked on top.
+				try {
+					doneFn?.();
+				} catch {
+					/* best effort */
+				}
+				try {
+					controller.overlay?.hide();
+				} catch {
+					/* best effort */
+				}
+			};
+			const controller: WorkersDashboardController = {
+				overlay: null,
+				close: finish,
+			};
+			workersDashboard = controller;
+			void ctx.ui
+				.custom<void>(
+					(tui, theme, _kb, done) => {
+						doneFn = () => done();
+						const themeAdapter: DashboardTheme = {
+							fg: (color, text) => theme.fg(color, text),
+						};
+						const host = {
+							requestRender: () => {
+								try {
+									tui.requestRender();
+								} catch {
+									/* best effort */
+								}
+							},
+							close: () => finish(),
+							// Overlay usable rows — never raw terminal rows when margins exist.
+							getHeight: () => Math.max(1, tui.terminal.rows - 2 * WORKERS_OVERLAY_MARGIN),
+						};
+						component = createWorkersDashboard(backend, host, { theme: themeAdapter, initialJobIds });
+						return component;
+					},
+					{
+						overlay: true,
+						overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: WORKERS_OVERLAY_MARGIN },
+						onHandle: (handle) => {
+							controller.overlay = handle;
+						},
+					},
+				)
+				.then(finish, finish);
 		},
 	});
 }

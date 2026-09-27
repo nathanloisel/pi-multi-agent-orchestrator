@@ -111,6 +111,42 @@ jobs still wait for the real result. In headless runs (no UI) questions return
 `unavailable` immediately instead of hanging; timeouts and cancellations are
 always explicit — a worker never receives a fabricated answer.
 
+## Workers dashboard (`/workers`)
+
+Type `/workers` in the main TUI session to open a live worker dashboard, or
+pass explicit ids (`/workers build-1 test-2`) to pin panes from the start —
+unknown ids are reported and ignored. Panes sit side by side and wrap into a
+2x2/grid layout as width allows, paginating rows on short terminals (at most
+4 panes open by default, 8 max).
+
+Each pane shows the worker's recent output and its own prompt line: type and
+press Enter to steer that live worker directly over the same ACK-gated
+`messageJob` channel as `jobs action=message`. The prompt is recorded as
+delivered only when the worker accepts it — a delivery ACK never claims the
+agent's work is done — and a failed send keeps your draft. Panes for
+finished/waiting workers stay readable with input disabled.
+
+Keyboard: `Ctrl+O` job picker · `Ctrl+W` close pane · `Tab`/`Shift+Tab` focus ·
+`PageUp`/`PageDown` scroll · `End` follow latest · `Enter` send · `Esc` close.
+Running `/workers` again focuses the open dashboard instead of opening a
+duplicate.
+
+Bounds and performance:
+
+- **Session-local capture** — output streams from live runs into bounded
+  in-memory buffers: 64 KiB + 200 entries per job (truthful truncation
+  markers), 48 buffered jobs. Nothing is persisted for replay; closing the
+  dashboard keeps capturing (bounded) while workers run.
+- **Adaptive layout** — width/height drive column wrapping and row pagination;
+  transcript wrapping is cached per revision+width and offscreen panes are not
+  rendered.
+- **Event-driven rendering** — worker bursts coalesce into at most one redraw
+  per ~33 ms; job metadata is cached on open and status changes, so no
+  filesystem scans ever happen from render or per-token paths.
+
+The dashboard requires the interactive TUI (main session); RPC/headless
+sessions get a clear `unavailable` reply and no overlay is opened.
+
 ## Checkpoint mailbox (persisted peer messages)
 
 Alongside live messaging, workers can exchange bounded, persisted peer
