@@ -2,10 +2,18 @@
  * core/result.ts — canonical JobResult handling (§4).
  *
  * Extraction pipeline (most reliable first):
- *   1. attempt/result.json written by the worker via its file tools (preferred)
+ *   1. attempt/result.json written by the worker via its file tools (preferred;
+ *      FILE delivery only — callers pass delivery from resultDeliveryFor(agent))
  *   2. fenced ```json block in the worker's final message
  *   3. legacy fenced ```report markdown block → lenient mapping (compat)
  *   4. malformed → synthetic failure result, raw output preserved for debugging
+ *
+ * Delivery-aware: fenced-message (write-restricted) workers IGNORE any
+ * persisted canonical result.json — follow-ups/resumes reuse the same attempt
+ * directory, so a stale file from a previous run must never shadow fresh
+ * fenced output, and fresh malformed/prose-only output must fail instead of
+ * returning the stale success. The stale file is never deleted before a
+ * successful extraction, so prior history stays on disk.
  *
  * report.md is always RENDERED FROM the validated result, never the other way
  * around.
@@ -22,6 +30,7 @@ import {
 	type ValidationOutcome,
 } from "./types.ts";
 import { atomicWriteJson, atomicWriteText } from "./storage.ts";
+import type { ResultDelivery } from "./prompts.ts";
 
 export interface ExtractedResult {
 	result: JobResult;
@@ -75,15 +84,25 @@ export function extractResult(opts: {
 	finalText: string;
 	jobId: string;
 	attemptId: string;
+	/** Result delivery of the owning agent (shared resultDeliveryFor). When
+	 *  "fenced-message", any persisted canonical result.json is ignored and the
+	 *  fresh final message is authoritative (file path defaults to "file" →
+	 *  unchanged file-first behavior for write-capable workers). */
+	delivery?: ResultDelivery;
 }): ExtractedResult {
 	const { attemptDir, finalText, jobId, attemptId } = opts;
 	const repairs: string[] = [];
+	const ignorePersistedFile = (opts.delivery ?? "file") === "fenced-message";
 
-	// 1. worker-written result.json (canonical path)
+	// 1. worker-written result.json (canonical path — file-capable workers only)
 	const resultFile = path.join(attemptDir, "result.json");
 	let candidate: unknown = null;
 	let source: ExtractedResult["source"] = "synthetic";
-	if (fs.existsSync(resultFile)) {
+	if (ignorePersistedFile && fs.existsSync(resultFile)) {
+		// follow-up/resume reuses this attempt dir: the persisted file is a
+		// PREVIOUS run's canonical result and must not shadow fresh fenced output.
+		repairs.push("fenced-message delivery: persisted result.json ignored; final message is authoritative");
+	} else if (fs.existsSync(resultFile)) {
 		try {
 			candidate = JSON.parse(fs.readFileSync(resultFile, "utf-8"));
 			source = "file";

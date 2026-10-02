@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, describe, it } from "node:test";
-import { MAX_STREAM_BYTES, StreamCapture, runWorker, type SpawnRequest } from "../core/spawn.ts";
+import { MAX_STREAM_BYTES, StreamCapture, runWorker, type SpawnRequest, type WorkerControl } from "../core/spawn.ts";
 import { makeAgent } from "./helpers.ts";
 
 const roots: string[] = [];
@@ -41,12 +41,33 @@ fs.writeFileSync(
 	[
 		"import * as fs from 'node:fs';",
 		"const spec = JSON.parse(fs.readFileSync(process.env.FAKE_SPEC, 'utf8'));",
+		"let stdinBuf = '';",
+		"process.stdin.setEncoding('utf8');",
+		"function readStdinLine() {",
+		"  return new Promise((resolve) => {",
+		"    const pump = () => {",
+		"      const i = stdinBuf.indexOf('\\n');",
+		"      if (i !== -1) { resolve(stdinBuf.slice(0, i)); stdinBuf = stdinBuf.slice(i + 1); return true; }",
+		"      return false;",
+		"    };",
+		"    if (pump()) return;",
+		"    const onData = (d) => { stdinBuf += d; if (pump()) process.stdin.off('data', onData); };",
+		"    process.stdin.on('data', onData);",
+		"  });",
+		"}",
 		"for (const seg of spec.segments ?? []) {",
 		"  if (seg.write) process.stdout.write(seg.write);",
+		"  if (seg.respondStdin) {",
+		"    const line = await readStdinLine();",
+		"    const cmd = JSON.parse(line);",
+		"    process.stdout.write(JSON.stringify({ type: 'response', id: cmd.id, success: true }) + '\\n');",
+		"  }",
 		"  if (seg.waitFor) {",
 		"    while (!fs.existsSync(seg.waitFor)) await new Promise((r) => setTimeout(r, 5));",
 		"  }",
 		"}",
+		"process.stdin.pause();",
+		"if (typeof process.stdin.unref === 'function') process.stdin.unref();",
 		"process.exitCode = spec.exitCode ?? 0;",
 		"",
 	].join("\n"),
@@ -258,5 +279,84 @@ describe("runWorker stream capture", () => {
 		assert.equal(outcome.usage.input, 3);
 		assert.equal(outcome.usage.output, 4);
 		assert.ok(fs.statSync(path.join(attemptDir, "stream.jsonl")).isDirectory(), "capture target untouched by failure");
+	});
+});
+
+// ── onEvent seam: raw parsed events, never affecting the run ───────────────
+
+describe("runWorker onEvent seam", () => {
+	it("forwards raw parsed events in order without changing the result", async () => {
+		const attemptDir = tmp("orch-stream-attempt-");
+		const signal = path.join(attemptDir, "go");
+		const first =
+			`${JSON.stringify({ type: "session_start", sessionId: "s" })}\n` +
+			`${JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } })}\n`;
+		const spec = writeSpec({
+			segments: [{ write: first }, { respondStdin: true }, { waitFor: signal }, { write: JSON.stringify(assistantEnd) }],
+		});
+		const seen: Array<{ type: string; [key: string]: unknown }> = [];
+		const req = makeReq(attemptDir, { launchEnv: { FAKE_SPEC: spec } });
+		req.onEvent = (event) => seen.push(event);
+
+		const promise = runWorker(req);
+		await waitFor(() => seen.some((e) => e.type === "message_update"));
+		fs.writeFileSync(signal, "");
+		const outcome = await promise;
+
+		// result extraction is identical to a run without the observer
+		assert.equal(outcome.finalText, "final answer");
+		assert.equal(outcome.usage.turns, 1);
+		assert.equal(outcome.usage.input, 3);
+		assert.equal(outcome.usage.output, 4);
+		assert.equal(outcome.exitCode, 0);
+		assert.equal(outcome.runError, undefined);
+
+		// raw event shapes and order preserved through the seam
+		const types = seen.map((e) => e.type);
+		assert.deepEqual(types.slice(0, 2), ["session_start", "message_update"]);
+		assert.ok(types.indexOf("message_end") > types.indexOf("message_update"));
+		assert.ok(types.includes("response"), "RPC ACK handling still flows on the same stream");
+		const update = seen.find((e) => e.type === "message_update") as { assistantMessageEvent?: { type?: unknown; delta?: unknown } };
+		assert.equal(update.assistantMessageEvent?.type, "text_delta");
+		assert.equal(update.assistantMessageEvent?.delta, "hi");
+
+		// identical outcome without any observer attached
+		const attemptDir2 = tmp("orch-stream-attempt-");
+		const spec2 = writeSpec({ segments: [{ write: first }, { respondStdin: true }, { write: JSON.stringify(assistantEnd) }] });
+		const outcome2 = await runWorker(makeReq(attemptDir2, { launchEnv: { FAKE_SPEC: spec2 } }));
+		assert.equal(outcome2.finalText, outcome.finalText);
+		assert.equal(outcome2.usage.turns, outcome.usage.turns);
+		assert.equal(outcome2.exitCode, outcome.exitCode);
+	});
+
+	it("swallows observer exceptions and keeps result and steer intact", async () => {
+		const attemptDir = tmp("orch-stream-attempt-");
+		const signal = path.join(attemptDir, "go");
+		const first =
+			`${JSON.stringify({ type: "session_start", sessionId: "s" })}\n` +
+			`${JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } })}\n`;
+		const spec = writeSpec({
+			segments: [{ write: first }, { respondStdin: true }, { waitFor: signal }, { respondStdin: true }, { write: JSON.stringify(assistantEnd) }],
+		});
+		const req = makeReq(attemptDir, { launchEnv: { FAKE_SPEC: spec } });
+		req.onEvent = () => {
+			throw new Error("observer boom");
+		};
+		let control: WorkerControl | undefined;
+		req.onControl = (c) => {
+			control = c;
+		};
+
+		const promise = runWorker(req);
+		await waitFor(() => control !== undefined);
+		const steerPromise = control!.steer("nudge");
+		fs.writeFileSync(signal, "");
+		await steerPromise; // steering still ACKs through the transport unchanged
+
+		const outcome = await promise;
+		assert.equal(outcome.finalText, "final answer");
+		assert.equal(outcome.usage.turns, 1);
+		assert.equal(outcome.errorMessage, undefined);
+		assert.equal(outcome.runError, undefined);
 	});
 });

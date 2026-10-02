@@ -31,7 +31,12 @@ export type EventType =
 	| "validation.completed"
 	| "validation.failed"
 	| "budget.checked"
-	| "budget.exceeded";
+	| "budget.exceeded"
+	| "message.worker"
+	| "message.main"
+	| "request.received"
+	| "request.resolved"
+	| "request.expired";
 
 export interface OrchestratorEvent {
 	t: number; // epoch ms

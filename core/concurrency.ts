@@ -40,7 +40,9 @@ class Gate {
 			signal?.addEventListener("abort", entry.onAbort, { once: true });
 			this.queue.push(entry);
 		});
-		this.active++;
+		// The slot was reserved synchronously by drain() before resolving us,
+		// so the granted count must not be incremented again here (doing so
+		// after an await admits more waiters than `limit`).
 		return this.release();
 	}
 	private release(): () => void {
@@ -60,6 +62,10 @@ class Gate {
 				next.reject(new Error("aborted"));
 				continue;
 			}
+			// Reserve the slot synchronously, exactly once, before handing it
+			// over: the waiter's continuation runs in a later microtask, so
+			// counting it there would let this loop resolve the whole queue.
+			this.active++;
 			next.resolve();
 		}
 	}
