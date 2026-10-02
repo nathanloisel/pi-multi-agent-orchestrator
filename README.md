@@ -147,6 +147,20 @@ Bounds and performance:
 The dashboard requires the interactive TUI (main session); RPC/headless
 sessions get a clear `unavailable` reply and no overlay is opened.
 
+## Shared-event worker-control bridge (native sidebar)
+
+Separate from the optional `/workers` dashboard, this extension registers a
+small in-process **worker-control bridge** (`worker-control-bridge.ts`) on the
+shared host `pi.events` bus. The pi-session-desk **native sidebar** uses its
+fixed v1 protocol (`orchestrator:worker-control:request:v1` →
+`orchestrator:worker-control:response:v1`) to poll worker status and steer a
+running job's live worker with a prompt. Steering is strictly ACK-gated: the
+bridge answers `accepted` only after `messageJob()` resolves on the live
+worker's ACK, and only then notes the prompt on the worker feed. Requests are
+scoped to the canonical jobs root (`~/.pi/orchestrator/jobs`), bounded and
+deduplicated; no transport, TUI or model relay is involved and `/workers`
+keeps working unchanged.
+
 ## Checkpoint mailbox (persisted peer messages)
 
 Alongside live messaging, workers can exchange bounded, persisted peer
