@@ -212,7 +212,7 @@ function makeMockPi(): MockPi {
 		setModel: async () => {},
 		setThinkingLevel: () => {},
 		appendEntry: () => {},
-		events: { emit: () => {} },
+		events: { emit: () => {}, on: () => () => {} },
 	} as unknown as ExtensionAPI;
 	return { pi, handlers, tools, commands };
 }

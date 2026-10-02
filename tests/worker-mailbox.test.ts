@@ -161,7 +161,7 @@ function makeMockPi(activeTools: string[] = ["read", "write", "delegate", "jobs"
 			setModel: async () => {},
 			setThinkingLevel: () => {},
 			appendEntry: () => {},
-			events: { emit: () => {} },
+			events: { emit: () => {}, on: () => () => {} },
 			...(opts.omitSendMessage
 				? {}
 				: {

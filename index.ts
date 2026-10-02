@@ -46,6 +46,7 @@ import type { WorkerReply } from "./core/messaging.ts";
 import { askUserQuestion, disposeQuestionUi } from "./ask-user.ts";
 import { Orchestrator, type CreateJobInput, type RunReport } from "./core/orchestrator.ts";
 import { createWorkersDashboard, type DashboardTheme, type WorkersDashboardHandle } from "./workers-dashboard.ts";
+import { createWorkerControlBridge, type WorkerControlBridge } from "./worker-control-bridge.ts";
 import type { DashboardJob, DashboardSnapshot, WorkerDashboardBackend } from "./workers-dashboard-model.ts";
 import { PlannerTelemetryCollector, PlannerTelemetryStore } from "./core/telemetry.ts";
 import { scaffoldOrchestratorFiles } from "./core/scaffold.ts";
@@ -273,6 +274,16 @@ export default function (pi: ExtensionAPI) {
 	let orch: Orchestrator | null = null;
 	let registry: ModelRegistry | null = null;
 	let plannerTelemetry: PlannerTelemetryCollector | null = null;
+
+	// ── pi.events worker-control bridge (native sidebar → live workers, v1) ──
+	// Subscribed ONCE at extension startup (before any runtime exists): until
+	// session_start builds the runtime the bridge answers "unavailable" instead
+	// of dropping requests. getRuntime always resolves the CURRENT runtime
+	// (session/runtime replacement swaps it underneath); session_shutdown
+	// unsubscribes and fails in-flight work, and the next session_start's
+	// start() re-subscribes (idempotent).
+	const workerControlBridge: WorkerControlBridge = createWorkerControlBridge({ events: pi.events, getRuntime: () => orch });
+	workerControlBridge.start();
 
 	// ── Live progress (Plan widget) — a projection of persisted job state ──
 	let tracker = new ProgressTracker();
@@ -735,6 +746,10 @@ export default function (pi: ExtensionAPI) {
 			plannerTelemetry: plannerStore,
 			defaults: { model: sessionModel, budget: cfg.budgets, concurrency: cfg.concurrency },
 		});
+		// Runtime replacement: clear the bridge's dedup lifecycle and mark the
+		// generation, so any steer still awaiting the OLD runtime's ACK replies
+		// not-confirmed instead of claiming a successful new delivery.
+		workerControlBridge.reset();
 		for (const reg of registry.providerRegistrations()) {
 			try {
 				pi.registerProvider(reg.name, reg.config);
@@ -785,6 +800,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Main agent lockdown + config ───────────────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
+		// Re-subscribe the sidebar worker-control bridge (idempotent; first
+		// subscribe already happened at extension startup).
+		workerControlBridge.start();
 		const sessionModel = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id, effort: ctx.thinkingLevel } : undefined;
 		buildRuntime(ctx.cwd, sessionModel);
 		await loadMainHooks(ctx.cwd);
@@ -847,6 +865,9 @@ export default function (pi: ExtensionAPI) {
 		// feed/event listeners, cancel pending render tasks.
 		workersDashboard?.close();
 		workersDashboard = null;
+		// Sidebar bridge: unsubscribe from pi.events and fail in-flight requests;
+		// a late reply from the old runtime must never claim successful delivery.
+		workerControlBridge.dispose();
 		resetProgress();
 		teardownLiveMessaging();
 		uiCtx = null;

@@ -751,7 +751,7 @@ function makeMockPi(withMain: boolean) {
 		sendMessage: (message: SentMessage["message"], options?: SentMessage["options"]) => {
 			sent.push({ message, options });
 		},
-		events: { emit: () => {} },
+		events: { emit: () => {}, on: () => () => {} },
 	} as unknown as ExtensionAPI;
 	void withMain;
 	return { pi, handlers, tools, sent, activeToolCalls, activeNames: () => active };

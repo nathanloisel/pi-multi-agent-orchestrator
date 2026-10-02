@@ -133,7 +133,7 @@ function makeMockPi(): MockPi {
 		appendEntry: (customType: string, data: unknown) => {
 			entries.push({ customType, data });
 		},
-		events: { emit: () => {} },
+		events: { emit: () => {}, on: () => () => {} },
 	} as unknown as ExtensionAPI;
 	return { pi, handlers, tools, entries };
 }
