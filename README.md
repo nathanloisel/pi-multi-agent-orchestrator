@@ -51,11 +51,13 @@ your lockfile:
 
 - **Baseline (lockfile):** pi `0.85.1` — what `npm ci` installs for local dev.
 - **Current target:** pi `0.87.0` — required to pass before releases.
+- **Pinned major:** pi `1.0.0` — explicit additive support gate; the same suite
+  runs against the 1.0 line without dropping any older baseline.
 - **Latest canary:** `latest` runs weekly in CI and on every manual dispatch;
   a new pi that breaks this extension turns that job red (no allow-failure).
 
 CI runs the suite on a Node 22/24 × pi version matrix (`0.85.1`, `0.87.0`,
-`latest`) and prints the versions actually tested. The npm dependency and the
+`1.0.0`, `latest`) and prints the versions actually tested. The npm dependency and the
 `pi` binary you interact with are different things: the lockfile pins the
 installed `@earendil-works/pi-coding-agent` package, while the global `pi`
 command comes from your own install and can be newer.
@@ -67,6 +69,8 @@ reproducible baseline lockfile:
 npm ci                                   # reproducible baseline (0.85.1)
 npm run pi:test-version -- 0.87.0        # overlay node_modules with pi 0.87.0 + matching peers
 npm run release:check                    # typecheck + tests against 0.87.0
+npm run pi:test-version -- 1.0.0         # same overlay flow pinned at the 1.0 line
+npm run release:check
 npm run pi:test-version -- latest        # or the newest published release
 npm run release:check
 npm ci                                   # back to the baseline lock

@@ -22,7 +22,7 @@
  *
  * The CLI/peer versions under test are whatever node_modules currently holds:
  * the reproducible baseline lock (0.85.1) or a selected release installed by
- * scripts/install-pi-test-version.mjs (0.87.0 / latest). Both must pass.
+ * scripts/install-pi-test-version.mjs (0.87.0 / 1.0.0 / latest). All must pass.
  */
 
 import assert from "node:assert/strict";
@@ -61,6 +61,40 @@ describe("pi test-version planning (pure helper)", () => {
 			],
 		);
 		assert.match(describePlan(plan), /pi coding-agent 0\.87\.0/);
+		assert.match(describePlan(plan), /typebox@1\.3\.27/);
+	});
+
+	// Fixture mirrors the published metadata of the pinned 1.0 release
+	// (`npm view @earendil-works/pi-coding-agent@1.0.0 dependencies`): the 1.0
+	// line pairs @1.0.0 pi-ai/pi-tui specs with a pinned typebox. The CI matrix
+	// installs exactly this pairing, so the fixture guards the plan mapping.
+	it("maps the pinned 1.0.0 release onto its paired dependency specs and typebox", () => {
+		const plan = resolveInstallPlan({
+			requested: "1.0.0",
+			distTags: { latest: "1.0.0", "legacy-node20": "0.74.2" },
+			codingAgentDependencies: {
+				"@earendil-works/pi-ai": "^1.0.0",
+				"@earendil-works/pi-tui": "^1.0.0",
+				"@earendil-works/pi-agent-core": "^1.0.0",
+				typebox: "1.3.27",
+			},
+		});
+		assert.equal(plan.codingAgent.version, "1.0.0");
+		assert.deepEqual(
+			installSpecs(plan),
+			[
+				"@earendil-works/pi-coding-agent@1.0.0",
+				"@earendil-works/pi-ai@^1.0.0",
+				"@earendil-works/pi-tui@^1.0.0",
+				"typebox@1.3.27",
+			],
+		);
+		// The ai/tui specs stay paired on the same 1.0 line, and typebox uses the
+		// selected 1.0.0 release's own pinned spec.
+		assert.equal(plan.peers.find((p) => p.name === "@earendil-works/pi-ai")?.spec, "^1.0.0");
+		assert.equal(plan.peers.find((p) => p.name === "@earendil-works/pi-tui")?.spec, "^1.0.0");
+		assert.equal(plan.peers.find((p) => p.name === "typebox")?.spec, "1.3.27");
+		assert.match(describePlan(plan), /pi coding-agent 1\.0\.0/);
 		assert.match(describePlan(plan), /typebox@1\.3\.27/);
 	});
 
@@ -130,7 +164,7 @@ function resolveLocalPi(): { cliPath: string; version: string } {
  *
  * Tries standard require resolution first (works whenever the package exposes
  * a `require` condition), then falls back to walking ancestor node_modules
- * dirs — pi 0.85.1/0.87.0 only expose an `import` condition, which CJS
+ * dirs — pi 0.85.1/0.87.0/1.0.0 only expose an `import` condition, which CJS
  * require() cannot resolve.
  */
 function resolvePackageRoot(): string {

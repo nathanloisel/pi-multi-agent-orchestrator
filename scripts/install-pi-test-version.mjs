@@ -4,9 +4,11 @@
  *
  * The repository keeps a reproducible baseline lockfile (currently pi 0.85.1).
  * This script overlays node_modules with a DIFFERENT selected pi release
- * (e.g. 0.87.0 or 'latest') WITHOUT touching package.json / package-lock.json:
+ * (e.g. 0.87.0, 1.0.0, or 'latest') WITHOUT touching package.json /
+ * package-lock.json:
  *
  *     node scripts/install-pi-test-version.mjs 0.87.0
+ *     node scripts/install-pi-test-version.mjs 1.0.0
  *     npm run pi:test-version -- latest
  *
  * How it works:
@@ -57,7 +59,7 @@ async function main() {
 	const requested = process.argv[2];
 	if (!requested || process.argv.length > 3) {
 		console.error("Usage: node scripts/install-pi-test-version.mjs <version | dist-tag>");
-		console.error("Examples: 0.85.1 | 0.87.0 | latest");
+		console.error("Examples: 0.85.1 | 0.87.0 | 1.0.0 | latest");
 		process.exit(2);
 	}
 

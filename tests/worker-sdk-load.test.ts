@@ -1,8 +1,9 @@
 /**
  * Real SDK extension load smoke — loads worker.ts through the INSTALLED pi
  * SDK's public loader (`discoverAndLoadExtensions` from
- * `@earendil-works/pi-coding-agent`, present in both the project SDK 0.85.1
- * and the global runtime 0.87.1), so tool and event registration runs against
+ * `@earendil-works/pi-coding-agent`, present in the project SDK 0.85.1, the
+ * global runtime 0.87.1, and the pinned 1.0.0 test overlay), so tool and event
+ * registration runs against
  * the REAL ExtensionAPI implementation: jiti TypeScript module load, real
  * Extension objects (tools/handlers maps), real pi.sendMessage forwarding.
  *

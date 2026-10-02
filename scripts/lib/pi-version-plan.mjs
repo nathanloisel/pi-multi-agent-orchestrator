@@ -10,9 +10,8 @@
 const SEMVER_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
 
 /**
- * Resolve a requested pi release ("0.85.1", "0.87.0", "latest", or another
- * Resolve a requested pi release ("0.85.1", "0.87.0", "latest", or another
- * dist-tag) to an exact coding-agent version.
+ * Resolve a requested pi release ("0.85.1", "0.87.0", "1.0.0", "latest", or
+ * another dist-tag) to an exact coding-agent version.
  *
  * @param {{ requested: string, distTags: Record<string, string> | undefined }} input
  * @returns {string} exact version
